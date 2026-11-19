@@ -18,6 +18,7 @@ use crate::config::ScreenRegistry;
 use crate::host::SdkHost;
 use crate::jobs::JobQueue;
 use crate::models::{JobState, JobStatus, UploadJobRequest};
+use crate::runtime::UploadApiStatus;
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
@@ -48,6 +49,7 @@ pub struct ApiState {
     pub port: u16,
     /// 可选的共享 token：为空表示不校验（内网受控部署）。
     pub token: Option<String>,
+    pub upload_api_status: Arc<UploadApiStatus>,
 }
 
 /// 单个上传请求的请求体上限（素材文件本身走磁盘流式写入，不占同等内存）。
@@ -95,10 +97,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/api/jobs/{job_id}", get(get_job))
         .route("/api/screens", get(list_screens))
         .merge(protected)
-        .merge(
-            SwaggerUi::new("/swagger-ui")
-                .url("/api-docs/openapi.json", ApiDoc::openapi()),
-        )
+        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .with_state(state)
         // axum 默认请求体上限只有 2 MB，会让稍大的图片/视频全部解析失败。
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
@@ -125,18 +124,22 @@ pub async fn serve(state: ApiState, shutdown: Arc<AtomicBool>) -> std::io::Resul
         Ok(ip) => tokio::net::TcpListener::bind(std::net::SocketAddr::new(ip, port)).await?,
         Err(_) => tokio::net::TcpListener::bind(format!("{address}:{port}")).await?,
     };
+    state.upload_api_status.mark_running();
+    let api_status = state.upload_api_status.clone();
     info!(
         "上传接口 http://{display}:{port}（示例：POST /api/program；接口调试：http://{display}:{port}/swagger-ui/#/）"
     );
     // 优雅关闭：退出时置位 signal，停止接收新连接并排空在途请求。
-    axum::serve(listener, router(state))
+    let result = axum::serve(listener, router(state))
         .with_graceful_shutdown(async move {
             while !shutdown.load(Ordering::SeqCst) {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
             info!("上传接口收到关闭信号，停止接收新请求。");
         })
-        .await
+        .await;
+    api_status.mark_stopped();
+    result
 }
 
 #[derive(serde::Serialize, ToSchema)]
@@ -313,7 +316,10 @@ async fn set_geometry(
     Json(body): Json<GeometryRequest>,
 ) -> Response {
     if body.width <= 0 || body.height <= 0 {
-        return reject(StatusCode::BAD_REQUEST, "width/height 必须大于 0。".to_string());
+        return reject(
+            StatusCode::BAD_REQUEST,
+            "width/height 必须大于 0。".to_string(),
+        );
     }
     if !matches!(body.rotate, 0 | 90 | 180 | 270) {
         return reject(
@@ -375,13 +381,28 @@ pub struct UploadProgramForm {
         (status = 401, body = ApiError, description = "Bearer token 缺失或错误")
     )
 )]
-async fn upload_program(State(state): State<ApiState>, mut multipart: Multipart) -> Response {
+async fn upload_program(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> Response {
     // 非 Windows 平台没有 LedSDK：早点返回 503，避免把文件收完才失败。
     if !state.host.available() {
         return reject(
             StatusCode::SERVICE_UNAVAILABLE,
             "本平台没有可用的 LedSDK（仅 Windows x64 / Linux x64），无法建树/导出/发送。"
                 .to_string(),
+        );
+    }
+    if headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|length| length > MAX_UPLOAD_BYTES as u64)
+    {
+        return reject(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("请求体超过上限 {} MB。", MAX_UPLOAD_BYTES / 1024 / 1024),
         );
     }
     let upload_root = PathBuf::from(&state.registry.sdk().upload_root);
@@ -424,10 +445,7 @@ async fn upload_program(State(state): State<ApiState>, mut multipart: Multipart)
                     }
                     Ok(None) => break,
                     Err(err) => {
-                        return reject(
-                            StatusCode::BAD_REQUEST,
-                            format!("读取表单字段失败：{err}"),
-                        );
+                        return reject(StatusCode::BAD_REQUEST, format!("读取表单字段失败：{err}"));
                     }
                 }
             }
@@ -517,12 +535,23 @@ async fn upload_program(State(state): State<ApiState>, mut multipart: Multipart)
 
     let request: UploadJobRequest = match serde_json::from_str(&request_text) {
         Ok(request) => request,
-        Err(err) => return reject(StatusCode::BAD_REQUEST, format!("request 不是合法 JSON：{err}")),
+        Err(err) => {
+            return reject(
+                StatusCode::BAD_REQUEST,
+                format!("request 不是合法 JSON：{err}"),
+            )
+        }
     };
 
     info!(
         "收到上传：文件名={} 类型={} 设备={} 窗口=[{},{},{}x{}]",
-        request.file_name, request.file_type, request.device_id, request.x, request.y, request.width, request.height
+        request.file_name,
+        request.file_type,
+        request.device_id,
+        request.x,
+        request.y,
+        request.width,
+        request.height
     );
 
     if request.file_name.trim().is_empty()
@@ -532,6 +561,18 @@ async fn upload_program(State(state): State<ApiState>, mut multipart: Multipart)
         return reject(
             StatusCode::BAD_REQUEST,
             "fileName / fileType / deviceId 都不能为空。".to_string(),
+        );
+    }
+    if !matches!(
+        request.file_type.trim().to_ascii_lowercase().as_str(),
+        "picture" | "image" | "gif" | "video" | "text"
+    ) {
+        return reject(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "不支持的 fileType '{}'（可用 picture / image / gif / video / text）。",
+                request.file_type
+            ),
         );
     }
     if request.x < 0 || request.y < 0 || request.width <= 0 || request.height <= 0 {
@@ -566,7 +607,10 @@ async fn upload_program(State(state): State<ApiState>, mut multipart: Multipart)
     let Some((file_name, path, size)) = staged.take() else {
         return reject(
             StatusCode::BAD_REQUEST,
-            format!("没有找到与 fileName '{}' 匹配的上传文件。", request.file_name),
+            format!(
+                "没有找到与 fileName '{}' 匹配的上传文件。",
+                request.file_name
+            ),
         );
     };
     if file_name != request.file_name {
@@ -582,7 +626,12 @@ async fn upload_program(State(state): State<ApiState>, mut multipart: Multipart)
 
     let status = state.jobs.submit(request, path);
     let location = format!("/api/jobs/{}", status.job_id);
-    (StatusCode::ACCEPTED, [(header::LOCATION, location)], Json(status)).into_response()
+    (
+        StatusCode::ACCEPTED,
+        [(header::LOCATION, location)],
+        Json(status),
+    )
+        .into_response()
 }
 
 /// 已落盘的上传文件：任何提前返回都会删掉它，成功入队前调用 `take()` 交出所有权。

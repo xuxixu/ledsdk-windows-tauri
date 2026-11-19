@@ -1,6 +1,8 @@
 //! 自检：结构体布局、SDK 装载、生命周期（无窗口，命令行 `--selfcheck`）。
 
+use std::io::{Read, Write};
 use std::mem::size_of;
+use std::net::TcpStream;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
@@ -50,22 +52,47 @@ fn check_layouts() -> i32 {
     failures += expect("LedsdkConfig", size_of::<ffi::LedsdkConfig>(), 48);
     failures += expect("LedsdkHttpOptions", size_of::<ffi::LedsdkHttpOptions>(), 80);
     failures += expect("LedsdkHttpStatus", size_of::<ffi::LedsdkHttpStatus>(), 32);
-    failures += expect("LedsdkSearchOptions", size_of::<ffi::LedsdkSearchOptions>(), 32);
+    failures += expect(
+        "LedsdkSearchOptions",
+        size_of::<ffi::LedsdkSearchOptions>(),
+        32,
+    );
     failures += expect("LedsdkDeviceInfo", size_of::<ffi::LedsdkDeviceInfo>(), 64);
-    failures += expect("LedsdkDeviceAddress", size_of::<ffi::LedsdkDeviceAddress>(), 48);
+    failures += expect(
+        "LedsdkDeviceAddress",
+        size_of::<ffi::LedsdkDeviceAddress>(),
+        48,
+    );
     failures += expect("LedsdkPlayRule", size_of::<ffi::LedsdkPlayRule>(), 80);
     failures += expect("LedsdkFontOptions", size_of::<ffi::LedsdkFontOptions>(), 64);
-    failures += expect("LedsdkTextOptions", size_of::<ffi::LedsdkTextOptions>(), 128);
-    failures += expect("LedsdkExportOptions", size_of::<ffi::LedsdkExportOptions>(), 80);
+    failures += expect(
+        "LedsdkTextOptions",
+        size_of::<ffi::LedsdkTextOptions>(),
+        128,
+    );
+    failures += expect(
+        "LedsdkExportOptions",
+        size_of::<ffi::LedsdkExportOptions>(),
+        80,
+    );
     failures += expect("LedsdkSendOptions", size_of::<ffi::LedsdkSendOptions>(), 56);
     failures += expect("LedsdkTaskEvent", size_of::<ffi::LedsdkTaskEvent>(), 64);
     failures += expect("LedsdkTaskStatus", size_of::<ffi::LedsdkTaskStatus>(), 40);
-    failures += expect("LedsdkRuntimeStatus", size_of::<ffi::LedsdkRuntimeStatus>(), 48);
+    failures += expect(
+        "LedsdkRuntimeStatus",
+        size_of::<ffi::LedsdkRuntimeStatus>(),
+        48,
+    );
     failures
 }
 
 fn check_version() -> i32 {
     println!("SDK 版本：");
+    let library = Path::new(&default_bin_directory()).join(ffi::library_name());
+    if let Err(err) = ffi::load(&library) {
+        println!("  [FAIL] 加载 SDK 失败：{err}");
+        return 1;
+    }
     let (mut major, mut minor, mut patch, mut abi) = (0u32, 0u32, 0u32, 0u32);
     let rc = unsafe { ffi::ledsdk_get_api_version(&mut major, &mut minor, &mut patch, &mut abi) };
     if rc != ffi::result::OK {
@@ -109,8 +136,20 @@ fn check_registry_edits() -> i32 {
 
     let registry = ScreenRegistry::load(&path);
     let mut failures = 0;
-    failures += expect_bool("编辑已存在条目", registry.update_screen("dev-1", "s1-改名", "10.0.0.10", 20004, 1280, 128, 90).is_ok(), true);
-    failures += expect_bool("编辑不存在的条目", registry.update_screen("dev-x", "s1", "10.0.0.10", 20004, 1280, 128, 90).is_err(), true);
+    failures += expect_bool(
+        "编辑已存在条目",
+        registry
+            .update_screen("dev-1", "s1-改名", "10.0.0.10", 20004, 1280, 128, 90)
+            .is_ok(),
+        true,
+    );
+    failures += expect_bool(
+        "编辑不存在的条目",
+        registry
+            .update_screen("dev-x", "s1", "10.0.0.10", 20004, 1280, 128, 90)
+            .is_err(),
+        true,
+    );
     failures += expect_bool(
         "非法几何给出原因",
         registry
@@ -123,15 +162,44 @@ fn check_registry_edits() -> i32 {
     let reloaded = crate::config::load_or_default(&path);
     let edited = reloaded.screens.first().cloned().unwrap_or_default();
     failures += expect_bool("改后名称已落盘", edited.name == "s1-改名", true);
-    failures += expect_bool("改后地址已落盘", edited.ip == "10.0.0.10" && edited.port == 20004, true);
-    failures += expect_bool("改后几何已落盘", edited.width == 1280 && edited.height == 128 && edited.rotate == 90, true);
+    failures += expect_bool(
+        "改后地址已落盘",
+        edited.ip == "10.0.0.10" && edited.port == 20004,
+        true,
+    );
+    failures += expect_bool(
+        "改后几何已落盘",
+        edited.width == 1280 && edited.height == 128 && edited.rotate == 90,
+        true,
+    );
     failures += expect_bool("deviceId 不变", edited.device_id == "dev-1", true);
 
-    failures += expect_bool("删除已存在条目", registry.remove_screen("dev-1", "").is_ok(), true);
+    failures += expect_bool(
+        "删除已存在条目",
+        registry.remove_screen("dev-1", "").is_ok(),
+        true,
+    );
     failures += expect_bool("删除后清单为空", registry.screens().is_empty(), true);
 
-    std::fs::write(&path, r#"{"Screens":[{"Name":"a","DeviceId":"d1"},{"Name":"b","DeviceId":"d2"}]}"#).ok();
+    std::fs::write(
+        &path,
+        r#"{"Screens":[{"Name":"a","DeviceId":"d1"},{"Name":"b","DeviceId":"d2"}]}"#,
+    )
+    .ok();
     failures += expect("重载条数", registry.reload(), 2);
+
+    let recover = directory.join("recover.json");
+    std::fs::write(&recover, "{ broken json").ok();
+    std::fs::write(
+        recover.with_extension("json.bak"),
+        r#"{"Screens":[{"Name":"bak","DeviceId":"bak-device"}]}"#,
+    )
+    .ok();
+    failures += expect_bool(
+        "坏配置从 .bak 恢复",
+        crate::config::load_or_default(&recover).screens.len() == 1,
+        true,
+    );
     failures
 }
 
@@ -154,27 +222,79 @@ fn check_package_guard() -> i32 {
 
     failures += expect_bool(
         "地址一致时通过",
-        verify_package(b"http://192.168.1.10:18080/a.zhd", "192.168.1.10", 18080, package).is_ok(),
+        verify_package(
+            b"http://192.168.1.10:18080/a.zhd",
+            "192.168.1.10",
+            18080,
+            package,
+        )
+        .is_ok(),
         true,
     );
     failures += expect_bool(
         "含 127.0.0.1 时拒绝",
-        verify_package(b"http://127.0.0.1:18080/a.zhd", "192.168.1.10", 18080, package).is_err(),
+        verify_package(
+            b"http://127.0.0.1:18080/a.zhd",
+            "192.168.1.10",
+            18080,
+            package,
+        )
+        .is_err(),
         true,
     );
     failures += expect_bool(
         "地址不一致时拒绝",
-        verify_package(b"http://192.168.1.11:18080/a.zhd", "192.168.1.10", 18080, package).is_err(),
+        verify_package(
+            b"http://192.168.1.11:18080/a.zhd",
+            "192.168.1.10",
+            18080,
+            package,
+        )
+        .is_err(),
         true,
     );
     failures += expect_bool(
         "前缀相同的地址不算匹配",
-        verify_package(b"http://192.168.1.100:18080/a.zhd", "192.168.1.10", 18080, package).is_err(),
+        verify_package(
+            b"http://192.168.1.100:18080/a.zhd",
+            "192.168.1.10",
+            18080,
+            package,
+        )
+        .is_err(),
         true,
     );
     failures += expect_bool(
         "端口不一致时拒绝",
-        verify_package(b"http://192.168.1.10:18081/a.zhd", "192.168.1.10", 18080, package).is_err(),
+        verify_package(
+            b"http://192.168.1.10:18081/a.zhd",
+            "192.168.1.10",
+            18080,
+            package,
+        )
+        .is_err(),
+        true,
+    );
+    failures += expect_bool(
+        "大写/混合大小写 scheme 可识别",
+        verify_package(
+            b"HTTP://192.168.1.10:18080/a.zhd",
+            "192.168.1.10",
+            18080,
+            package,
+        )
+        .is_ok(),
+        true,
+    );
+    failures += expect_bool(
+        "127/8 回环地址拒绝",
+        verify_package(
+            b"http://127.0.0.2:18080/a.zhd",
+            "192.168.1.10",
+            18080,
+            package,
+        )
+        .is_err(),
         true,
     );
     failures += expect_bool(
@@ -238,9 +358,11 @@ fn check_retention() -> i32 {
     let logs = root.join("logs");
     let resources = export.join("resources");
     let sub = export.join("sub");
+    let nested = export.join("nested");
+    let nested_resources = nested.join("resources");
     let other = root.join("other");
     let upload = root.join("upload");
-    for dir in [&logs, &resources, &sub, &other, &upload] {
+    for dir in [&logs, &resources, &sub, &nested_resources, &other, &upload] {
         if let Err(err) = std::fs::create_dir_all(dir) {
             println!("  [FAIL] 建目录 {}：{err}", dir.display());
             return 1;
@@ -266,10 +388,15 @@ fn check_retention() -> i32 {
     let today_day = logs.join("today");
     let setup = (|| -> Result<(), String> {
         write(&export.join("old.zhl"), "old", Some(old))?;
-        write(&export.join("new.zhl"), "keep.png", None)?;
+        write(&export.join("new.zhl"), "keep.png a.zhd", None)?;
         write(&resources.join("keep.png"), "kept", Some(old))?;
         write(&resources.join("dead.png"), "gone", Some(old))?;
         write(&sub.join("old.zhd"), "gone", Some(old))?;
+        write(&export.join("a.zhd"), "kept", Some(old))?;
+        write(&export.join("aa.zhd"), "gone", Some(old))?;
+        write(&nested.join("nested.zhl"), "nested.png", None)?;
+        write(&nested_resources.join("nested.png"), "kept", Some(old))?;
+        write(&nested_resources.join("nested-dead.png"), "gone", Some(old))?;
         write(&export.join("notes.txt"), "别删我", Some(old))?;
         std::fs::create_dir_all(&old_day).map_err(|e| e.to_string())?;
         write(&old_day.join("app.log"), "old log", Some(old))?;
@@ -288,15 +415,35 @@ fn check_retention() -> i32 {
     let mut failures = 0;
     failures += expect_bool("过期 .zhl 已删除", export.join("old.zhl").exists(), false);
     failures += expect_bool("未过期 .zhl 保留", export.join("new.zhl").exists(), true);
-    failures += expect_bool("被引用的资源保留", resources.join("keep.png").exists(), true);
+    failures += expect_bool(
+        "被引用的资源保留",
+        resources.join("keep.png").exists(),
+        true,
+    );
     failures += expect_bool("无引用资源删除", resources.join("dead.png").exists(), false);
     failures += expect_bool("过期 .zhd 删除", sub.join("old.zhd").exists(), false);
+    failures += expect_bool("精确文件名引用保留", export.join("a.zhd").exists(), true);
+    failures += expect_bool("子串同名文件删除", export.join("aa.zhd").exists(), false);
+    failures += expect_bool(
+        "嵌套清单引用资源保留",
+        nested_resources.join("nested.png").exists(),
+        true,
+    );
+    failures += expect_bool(
+        "嵌套无引用资源删除",
+        nested_resources.join("nested-dead.png").exists(),
+        false,
+    );
     failures += expect_bool("无关文件不动", export.join("notes.txt").exists(), true);
     failures += expect_bool("过期日志目录整目录删除", old_day.exists(), false);
     failures += expect_bool("当天日志目录保留", today_day.join("app.log").exists(), true);
-    failures += expect_bool("删除计数 = 4", deleted == 4, true);
+    failures += expect_bool("删除计数 = 6", deleted == 6, true);
     let skipped = crate::retention::clean(&other, &upload, &logs, 30);
-    failures += expect_bool("非导出目录被跳过", skipped == 0 && other.join("stray.zhd").exists(), true);
+    failures += expect_bool(
+        "非导出目录被跳过",
+        skipped == 0 && other.join("stray.zhd").exists(),
+        true,
+    );
     failures
 }
 
@@ -341,10 +488,31 @@ fn check_lifecycle() -> i32 {
     };
 
     let mut failures = 0;
-    failures += if runtime.host.http_running() { 0 } else { println!("  [FAIL] HTTP 未运行"); 1 };
-    failures += if runtime.host.http_port() == 28080 { 0 } else { println!("  [FAIL] HTTP 端口不是 28080"); 1 };
-    failures += if runtime.registry.screens().len() == 1 { 0 } else { println!("  [FAIL] 屏幕数量不对"); 1 };
-    failures += if runtime.registry.screens()[0].has_geometry() { 0 } else { println!("  [FAIL] 几何未保存"); 1 };
+    failures += if runtime.host.http_running() {
+        0
+    } else {
+        println!("  [FAIL] HTTP 未运行");
+        1
+    };
+    failures += if runtime.host.http_port() == 28080 {
+        0
+    } else {
+        println!("  [FAIL] HTTP 端口不是 28080");
+        1
+    };
+    failures += if runtime.registry.screens().len() == 1 {
+        0
+    } else {
+        println!("  [FAIL] 屏幕数量不对");
+        1
+    };
+    failures += if runtime.registry.screens()[0].has_geometry() {
+        0
+    } else {
+        println!("  [FAIL] 几何未保存");
+        1
+    };
+    failures += check_http_hardening(&runtime);
     match runtime.host.runtime_status() {
         Some(status) if status.search_task_count >= 1 => {}
         _ => {
@@ -353,9 +521,19 @@ fn check_lifecycle() -> i32 {
         }
     }
 
-    runtime.stop();
+    failures += if runtime.stop() {
+        0
+    } else {
+        println!("  [FAIL] 关闭时 SDK 清理未完成");
+        1
+    };
 
-    failures += if !runtime.host.http_running() { 0 } else { println!("  [FAIL] 关闭后 HTTP 仍运行"); 1 };
+    failures += if !runtime.host.http_running() {
+        0
+    } else {
+        println!("  [FAIL] 关闭后 HTTP 仍运行");
+        1
+    };
     failures += if crate::config::load_or_default(&config_path).screens.len() == 1 {
         0
     } else {
@@ -366,10 +544,86 @@ fn check_lifecycle() -> i32 {
     failures
 }
 
+fn check_http_hardening(runtime: &crate::runtime::Runtime) -> i32 {
+    println!("SDK HTTP 文件服务隔离：");
+    let root = runtime.log_directory.parent().unwrap_or(Path::new("."));
+    let sdk = runtime.registry.sdk();
+    let export = Path::new(&sdk.export_root);
+    let upload = Path::new(&sdk.upload_root);
+    let inside = export.join("selfcheck-inside.txt");
+    let outside = root.join("selfcheck-outside.txt");
+    let inside_ok = std::fs::write(&inside, "inside-root").is_ok()
+        && std::fs::write(&outside, "outside-root").is_ok();
+    if !inside_ok {
+        println!("  [FAIL] 准备 HTTP 隔离测试文件失败");
+        return 1;
+    }
+    let port = runtime.host.http_port();
+    let mut failures = 0;
+    failures += expect_bool(
+        "根目录内相对下载可用",
+        http_request(port, "GET", "/selfcheck-inside.txt", &[])
+            .is_some_and(|(status, body)| status == 200 && body.contains("inside-root")),
+        true,
+    );
+    let absolute_path = format!("/{}", outside.to_string_lossy().replace('\\', "/"));
+    failures += expect_bool(
+        "绝对路径读取被拒绝",
+        http_request(port, "GET", &absolute_path, &[]).is_some_and(|(status, _)| status != 200),
+        true,
+    );
+    let put_status = http_request(port, "PUT", "/selfcheck-evil.txt", b"evil");
+    failures += expect_bool(
+        "SDK HTTP 上传被拒绝",
+        put_status.is_some_and(|(status, _)| status != 200),
+        true,
+    );
+    failures += expect_bool(
+        "上传暂存目录已被删除",
+        !upload.join(".sdk-http-incoming").exists(),
+        true,
+    );
+    let _ = std::fs::remove_file(&inside);
+    let _ = std::fs::remove_file(&outside);
+    failures
+}
+
+fn http_request(port: u16, method: &str, path: &str, body: &[u8]) -> Option<(u16, String)> {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(3))).ok()?;
+    let head = format!(
+        "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).ok()?;
+    if !body.is_empty() {
+        stream.write_all(body).ok()?;
+    }
+    stream.flush().ok()?;
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).ok()?;
+    let split = raw
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| index + 4)
+        .unwrap_or(raw.len());
+    let head_text = String::from_utf8_lossy(&raw[..split]);
+    let status = head_text
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())?;
+    Some((status, String::from_utf8_lossy(&raw[split..]).to_string()))
+}
+
 /// 找 SDK 运行文件所在目录：优先 exe 同级（build.rs 把 `sdk/x64` 或 `sdk/linux-x64` 的文件复制到这里），
 /// 再向上找 `sdk/<arch>`（直接从仓库跑 cargo 的情形）。
 pub fn default_bin_directory() -> String {
-    let library = if cfg!(windows) { "LedSDK.dll" } else { "libLedSDK.so.1" };
+    let library = if cfg!(windows) {
+        "LedSDK.dll"
+    } else {
+        "libLedSDK.so.1"
+    };
     let arch = if cfg!(windows) { "x64" } else { "linux-x64" };
     let exe_dir = std::env::current_exe()
         .ok()

@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -18,6 +18,8 @@ use crate::pipeline::{JobError, JobProcessor};
 const MAX_HISTORY: usize = 200;
 /// 关闭时等待 worker 退出的上限。
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
+/// 等待执行的作业上限：防止上传接口把磁盘/内存堆满。
+const MAX_QUEUED_JOBS: usize = 64;
 
 struct Job {
     id: String,
@@ -37,8 +39,12 @@ struct QueueInner {
     /// worker 已退出。
     finished: Mutex<bool>,
     finished_cv: Condvar,
+    /// 串行化“检查 closed + 入队”与 stop() 的“置 closed + 投递 Stop”。
+    enqueue_lock: Mutex<()>,
     /// stop() 一开始就置位：此后 submit 立即拒绝，避免作业排在 Stop 之后永久 Queued。
     closed: AtomicBool,
+    /// 已入队、尚未被 worker 取走的作业数。
+    queued: AtomicUsize,
 }
 
 #[derive(Clone)]
@@ -54,7 +60,9 @@ impl JobQueue {
             tx,
             finished: Mutex::new(false),
             finished_cv: Condvar::new(),
+            enqueue_lock: Mutex::new(()),
             closed: AtomicBool::new(false),
+            queued: AtomicUsize::new(0),
         });
         let worker = inner.clone();
         std::thread::spawn(move || worker_loop(worker, rx, host, registry));
@@ -64,6 +72,11 @@ impl JobQueue {
     pub fn submit(&self, request: UploadJobRequest, staged: PathBuf) -> JobStatus {
         let id = new_id();
         let now = now_iso();
+        let _enqueue = self
+            .inner
+            .enqueue_lock
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
 
         // 队列正在关闭（或与 Stop 竞态）时立即拒绝，不能排到 Stop 之后永久 Queued。
         if self.inner.closed.load(Ordering::SeqCst) {
@@ -79,6 +92,26 @@ impl JobQueue {
                 file_type: request.file_type,
                 package_path: None,
                 error: Some("服务正在关闭，拒绝新作业。".to_string()),
+                created_utc: now.clone(),
+                updated_utc: now,
+            };
+        }
+
+        let queued = self.inner.queued.fetch_add(1, Ordering::SeqCst);
+        if queued >= MAX_QUEUED_JOBS {
+            self.inner.queued.fetch_sub(1, Ordering::SeqCst);
+            warn!("作业 {id}：队列已满（{MAX_QUEUED_JOBS} 个待处理），拒绝入队。");
+            let _ = std::fs::remove_file(&staged);
+            return JobStatus {
+                job_id: id,
+                state: JobState::Failed,
+                progress: 0,
+                message: "作业队列已满，请稍后重试。".to_string(),
+                device_id: request.device_id,
+                file_name: request.file_name,
+                file_type: request.file_type,
+                package_path: None,
+                error: Some("作业队列已满，请稍后重试。".to_string()),
                 created_utc: now.clone(),
                 updated_utc: now,
             };
@@ -122,6 +155,7 @@ impl JobQueue {
             staged: staged.clone(),
         };
         if self.inner.tx.send(Message::Run(job)).is_err() {
+            self.inner.queued.fetch_sub(1, Ordering::SeqCst);
             self.update(&id, |row| {
                 row.state = JobState::Failed;
                 row.message = "作业队列已关闭。".to_string();
@@ -152,8 +186,15 @@ impl JobQueue {
     /// 调用方可以安全销毁 SDK；false 表示仍有作业在跑，应放弃清理直接退出。
     pub fn stop(&self) -> bool {
         // 先置 closed：此后并发 submit 立即拒绝，不会排在 Stop 之后。
-        self.inner.closed.store(true, Ordering::SeqCst);
-        let _ = self.inner.tx.send(Message::Stop);
+        {
+            let _enqueue = self
+                .inner
+                .enqueue_lock
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            self.inner.closed.store(true, Ordering::SeqCst);
+            let _ = self.inner.tx.send(Message::Stop);
+        }
         let guard = self
             .inner
             .finished
@@ -198,7 +239,10 @@ fn worker_loop(
         match message {
             Message::Stop => break,
             Message::Run(job) => {
-                let queue = QueueInnerHandle { inner: inner.clone() };
+                inner.queued.fetch_sub(1, Ordering::SeqCst);
+                let queue = QueueInnerHandle {
+                    inner: inner.clone(),
+                };
                 // 单线程 worker：一次 panic 就会让队列永久停摆（后续作业停在 Queued），
                 // 所以每个作业都兜住，失败就落到该作业自己身上。
                 let id = job.id.clone();
@@ -235,12 +279,7 @@ impl QueueInnerHandle {
     }
 }
 
-fn run_job(
-    queue: &QueueInnerHandle,
-    host: &SdkHost,
-    registry: &ScreenRegistry,
-    job: Job,
-) {
+fn run_job(queue: &QueueInnerHandle, host: &SdkHost, registry: &ScreenRegistry, job: Job) {
     let id = job.id.clone();
     queue.update(&id, |row| {
         row.state = JobState::Running;
@@ -250,13 +289,11 @@ fn run_job(
     info!("作业 {id}：开始处理");
 
     let settings = registry.sdk();
-    let devices = host.snapshot_devices();
-    let processor = JobProcessor::new(host, registry, settings, devices);
+    let processor = JobProcessor::new(host, registry, settings);
 
     let result = {
-        let queue_ref = &*queue;
         processor.process(&id, &job.request, &job.staged, |percent, message| {
-            queue_ref.update(&id, |row| {
+            queue.update(&id, |row| {
                 row.progress = percent;
                 row.message = message.to_string();
             });
@@ -281,7 +318,11 @@ fn run_job(
                 if done.sent { "已发送" } else { "仅导出" },
                 done.package_path,
                 done.export_directory,
-                if done.device_id.is_empty() { "（未指定）" } else { done.device_id.as_str() }
+                if done.device_id.is_empty() {
+                    "（未指定）"
+                } else {
+                    done.device_id.as_str()
+                }
             );
         }
         Err(err) => {

@@ -17,6 +17,8 @@ utoipa = { version = "5", features = ["macros"] }
 utoipa-swagger-ui = { version = "9", features = ["axum"] }
 time = { version = "0.3", features = ["local-offset"] }
 if-addrs = "0.15"
+libloading = "0.8"
+url = "2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [

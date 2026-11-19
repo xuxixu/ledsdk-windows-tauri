@@ -67,7 +67,13 @@ fn clean_plain_directory(directory: &Path, cutoff: SystemTime) -> std::io::Resul
     for entry in std::fs::read_dir(directory)? {
         let entry = entry?;
         let path = entry.path();
-        if path.is_dir() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
             // 日志按天一个目录（logs/yyyy-MM-dd/）：先清掉里面的过期文件；清空后目录一起删
             // （目录自身的 mtime 是「最后一次写入」，不能拿它判断过期）。
             let (inner_count, inner_bytes) = clean_plain_directory(&path, cutoff)?;
@@ -78,7 +84,7 @@ fn clean_plain_directory(directory: &Path, cutoff: SystemTime) -> std::io::Resul
             }
             continue;
         }
-        if !path.is_file() || !is_expired(&path, cutoff) {
+        if !file_type.is_file() || !is_expired(&path, cutoff) {
             continue;
         }
         let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
@@ -113,21 +119,19 @@ fn clean_export_directory(directory: &Path, cutoff: SystemTime) -> std::io::Resu
     let mut count = 0;
     let mut bytes = 0;
     let mut retained_text = String::new();
-
-    for entry in std::fs::read_dir(directory)? {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("zhl") {
-            continue;
-        }
+    let mut zhl_files = Vec::new();
+    collect_zhl_files(directory, &mut zhl_files);
+    for path in zhl_files {
         if is_expired(&path, cutoff) {
-            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
             if try_delete(&path) {
                 count += 1;
                 bytes += size;
             }
         } else if let Ok(text) = std::fs::read(&path) {
             retained_text.push_str(&String::from_utf8_lossy(&text));
+            // 多个清单直接拼接会把上一份末尾和下一份开头粘成一个假文件名。
+            retained_text.push('\n');
         }
     }
 
@@ -139,7 +143,13 @@ fn clean_export_directory(directory: &Path, cutoff: SystemTime) -> std::io::Resu
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
                 stack.push(path);
                 continue;
             }
@@ -159,7 +169,7 @@ fn clean_export_directory(directory: &Path, cutoff: SystemTime) -> std::io::Resu
             // .zhd/.zhp/resources 里都只看「是否被保留清单引用」：备份还原或增量导出时，
             // 被保留 .zhl 引用的 .zhd/.zhp mtime 可能很旧，单纯按时间删会破坏节目包。
             let keep = if is_artifact {
-                retained_text.contains(&name)
+                mentions_token(&retained_text, &name)
             } else {
                 !is_expired(&path, cutoff)
             };
@@ -182,12 +192,81 @@ fn looks_like_export_directory(directory: &Path) -> bool {
     if directory.join(".ledsdk-export").is_file() {
         return true;
     }
-    let Ok(entries) = std::fs::read_dir(directory) else {
+    let mut zhl_files = Vec::new();
+    collect_zhl_files(directory, &mut zhl_files);
+    !zhl_files.is_empty()
+}
+
+/// 递归收集 `.zhl`，跳过符号链接目录，避免清理时跟随链接离开导出目录。
+fn collect_zhl_files(directory: &Path, out: &mut Vec<PathBuf>) {
+    let mut stack = vec![directory.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                stack.push(path);
+            } else if file_type.is_file()
+                && path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("zhl"))
+            {
+                out.push(path);
+            }
+        }
+    }
+}
+
+/// 只把独立出现的文件名视为引用，避免 `a.zhd` 误匹配 `aa.zhd` 这类子串。
+fn mentions_token(text: &str, name: &str) -> bool {
+    if name.is_empty() {
         return false;
-    };
-    entries.flatten().any(|entry| {
-        entry.path().extension().and_then(|ext| ext.to_str()) == Some("zhl")
+    }
+    text.match_indices(name).any(|(index, _)| {
+        let before = text[..index].chars().next_back();
+        let after = text[index + name.len()..].chars().next();
+        is_token_boundary(before) && is_token_boundary(after)
     })
+}
+
+fn is_token_boundary(value: Option<char>) -> bool {
+    match value {
+        None => true,
+        Some(value) => {
+            value.is_whitespace()
+                || matches!(
+                    value,
+                    '/' | '\\'
+                        | '"'
+                        | '\''
+                        | '='
+                        | ','
+                        | ';'
+                        | '?'
+                        | '&'
+                        | '<'
+                        | '>'
+                        | '('
+                        | ')'
+                        | '['
+                        | ']'
+                        | '{'
+                        | '}'
+                        | ':'
+                        | '|'
+                        | '#'
+                )
+        }
+    }
 }
 
 fn is_expired(path: &Path, cutoff: SystemTime) -> bool {
@@ -209,7 +288,7 @@ fn try_delete(path: &Path) -> bool {
 
 /// 只清理真实存在的普通目录；盘符根 / 共享根一律拒绝。
 fn is_safe_directory(directory: &Path) -> bool {
-    if directory.as_os_str().is_empty() || !directory.is_dir() {
+    if directory.as_os_str().is_empty() || !directory.is_absolute() || !directory.is_dir() {
         return false;
     }
     let full: PathBuf = directory.to_path_buf();
@@ -228,5 +307,36 @@ fn format_size(bytes: u64) -> String {
         format!("{bytes} B")
     } else {
         format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_matching_avoids_substrings() {
+        assert!(mentions_token("keep.png a.zhd", "a.zhd"));
+        assert!(!mentions_token("aa.zhd", "a.zhd"));
+    }
+
+    #[test]
+    fn referenced_artifact_survives_cleanup() {
+        let root = std::env::temp_dir().join("ledsdk-retention-test");
+        let export = root.join("export");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&export).unwrap();
+        std::fs::write(export.join("keep.zhl"), "a.zhd").unwrap();
+        std::fs::write(export.join("a.zhd"), "kept").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(40 * 86_400);
+        let file = std::fs::File::options()
+            .write(true)
+            .open(export.join("a.zhd"))
+            .unwrap();
+        file.set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 86_400);
+        let _ = clean_export_directory(&export, cutoff).unwrap();
+        assert!(export.join("a.zhd").exists());
     }
 }

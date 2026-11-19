@@ -5,15 +5,47 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
 
 use log::{debug, info, warn};
 
 use crate::config::ScreenRegistry;
 use crate::host::SdkHost;
 use crate::jobs::JobQueue;
+
+/// 上传 API 的启动/运行状态，供窗口状态栏区分“SDK HTTP 服务”和“上传接口”。
+#[derive(Default)]
+pub struct UploadApiStatus {
+    running: AtomicBool,
+    error: Mutex<Option<String>>,
+}
+
+impl UploadApiStatus {
+    pub fn running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
+    }
+
+    pub fn error(&self) -> Option<String> {
+        self.error
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone()
+    }
+
+    pub fn mark_running(&self) {
+        *self.error.lock().unwrap_or_else(|err| err.into_inner()) = None;
+        self.running.store(true, Ordering::SeqCst);
+    }
+
+    pub fn mark_stopped(&self) {
+        self.running.store(false, Ordering::SeqCst);
+    }
+
+    pub fn mark_failed(&self, error: impl Into<String>) {
+        *self.error.lock().unwrap_or_else(|err| err.into_inner()) = Some(error.into());
+        self.running.store(false, Ordering::SeqCst);
+    }
+}
 
 pub struct Runtime {
     pub registry: Arc<ScreenRegistry>,
@@ -23,6 +55,7 @@ pub struct Runtime {
     pub log_directory: PathBuf,
     /// HTTP 服务优雅关闭信号：退出时先置位，serve() 停止接收新请求并排空在途请求。
     pub http_shutdown: Arc<AtomicBool>,
+    pub upload_api_status: Arc<UploadApiStatus>,
 }
 
 impl Runtime {
@@ -40,6 +73,9 @@ impl Runtime {
 
         let registry = Arc::new(ScreenRegistry::load(config_path));
         let settings = registry.sdk();
+        settings.validate(&crate::config::base_dir_of(config_path))?;
+        let current = registry.settings();
+        current.upload_api.validate()?;
 
         info!(
             "运行路径：配置={} 日志={} 导出={} 上传暂存={} 转码缓存={}",
@@ -50,7 +86,7 @@ impl Runtime {
             settings.transcode_cache_root
         );
 
-        let app_settings = registry.settings().app;
+        let app_settings = current.app;
         crate::retention::clean(
             Path::new(&settings.export_root),
             Path::new(&settings.upload_root),
@@ -82,6 +118,7 @@ impl Runtime {
             config_path: config_path.to_path_buf(),
             log_directory: log_directory.to_path_buf(),
             http_shutdown: Arc::new(AtomicBool::new(false)),
+            upload_api_status: Arc::new(UploadApiStatus::default()),
         }))
     }
 
@@ -115,27 +152,18 @@ impl Runtime {
         self.http_shutdown.store(true, Ordering::SeqCst);
         // 2) 等作业队列停下。
         if self.jobs.stop() {
-            self.host.shutdown();
-            info!("运行环境已关闭。");
-            return true;
+            if self.host.shutdown() {
+                info!("运行环境已关闭。");
+                return true;
+            }
+            warn!("SDK 有任务未在限定时间内停止，放弃清理，交给 watchdog 强制退出。");
+            return false;
         }
-        // 3) 作业仍在跑（可能是 10 分钟的导出）：不能直接销毁 SDK，
-        //    但也不能像原来那样直接 return 跳过清理——那样 watchdog 在主线程
-        //    提前返回后来不及兜底。放到独立线程限时等，超时就交给 watchdog。
-        warn!("仍有作业在运行，在独立线程里限时等待清理 SDK。");
-        let host = self.host.clone();
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            host.shutdown();
-            let _ = tx.send(());
-        });
-        if rx.recv_timeout(Duration::from_secs(5)).is_ok() {
-            info!("运行环境已关闭（作业收尾后）。");
-            true
-        } else {
-            warn!("SDK 清理超过 5 秒仍未完成，交给 watchdog 强制退出。");
-            false
-        }
+        // 3) 作业仍在跑（可能是 10 分钟的导出）：绝不能在 worker 仍使用句柄时并发
+        //    shutdown/release。放弃清理，由 8 秒 watchdog 结束整个进程（作业对象会
+        //    连带结束 ffmpeg/TextRenderer）。
+        warn!("仍有作业在运行，放弃 SDK 清理，交给 watchdog 强制退出。");
+        false
     }
 
     /// 手动扫描：取一次搜索快照，刷新自动字段并立即写回配置。返回（设备数，变更数）。
@@ -160,8 +188,8 @@ impl Runtime {
     }
 
     pub fn log_tail(&self, lines: usize) -> Vec<String> {
-        let now = time::OffsetDateTime::now_local()
-            .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+        let now =
+            time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
         // 常规日志与异常日志分开写（app.log / errors.log），面板要一起看；
         // 当天不够时再补前一天，避免刚过零点面板变空。
         let mut collected: Vec<String> = Vec::new();

@@ -28,7 +28,11 @@ impl SdkError {
         }
     }
 
-    pub fn with_detail(result: i32, operation: impl Into<String>, detail: impl Into<String>) -> Self {
+    pub fn with_detail(
+        result: i32,
+        operation: impl Into<String>,
+        detail: impl Into<String>,
+    ) -> Self {
         Self {
             result,
             operation: operation.into(),
@@ -88,6 +92,8 @@ pub struct SdkHost {
     inner: Mutex<Inner>,
     /// 关闭开始后置位：此后再提交任务 / 取搜索快照一律直接失败，避免调用已释放的句柄。
     shutting_down: AtomicBool,
+    /// SDK 已完整释放；用于 shutdown 幂等与重复调用等待。
+    closed: AtomicBool,
 }
 
 /// 含内嵌 NUL 的字符串无法交给 C：明确报错，而不是静默降级成空串。
@@ -117,6 +123,7 @@ impl SdkHost {
                 version: String::new(),
             }),
             shutting_down: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
         }
     }
 
@@ -175,30 +182,29 @@ impl SdkHost {
             return Ok(());
         }
         let bin = Path::new(&settings.bin_directory);
-        // Windows 载入 LedSDK.dll；Linux 由动态链接器按 SONAME 找 libLedSDK.so.1（rpath 指向 exe 目录）。
-        let library = if cfg!(windows) {
-            bin.join("LedSDK.dll")
-        } else {
-            bin.join("libLedSDK.so.1")
-        };
+        let library = bin.join(ffi::library_name());
         if !library.exists() {
             return Err(SdkError::with_detail(
-                ffi::result::INTERNAL_ERROR,
+                ffi::result::IO_ERROR,
                 "加载 LedSDK",
                 format!("未找到 {}", library.display()),
             ));
         }
-        // 不再改进程 PATH：DLL 与子进程（ffmpeg / TextRenderer）都按「exe 所在目录优先」解析，
-        // 而多线程进程里 set_var("PATH") 是不健全的（Rust 文档明确禁止）。
+        ffi::load(&library).map_err(|err| {
+            SdkError::with_detail(ffi::result::INTERNAL_ERROR, "加载 LedSDK", err)
+        })?;
+        // 不再改进程 PATH：SDK 本体由 libloading 按 BinDirectory 的绝对路径装载；
+        // 多线程进程里 set_var("PATH") 是不健全的（Rust 文档明确禁止）。
 
         let (mut major, mut minor, mut patch, mut abi) = (0u32, 0u32, 0u32, 0u32);
-        let rc = unsafe { ffi::ledsdk_get_api_version(&mut major, &mut minor, &mut patch, &mut abi) };
+        let rc =
+            unsafe { ffi::ledsdk_get_api_version(&mut major, &mut minor, &mut patch, &mut abi) };
         if rc != ffi::result::OK {
             return Err(SdkError::new(rc, "ledsdk_get_api_version"));
         }
         if abi != 2 {
             return Err(SdkError::with_detail(
-                ffi::result::INTERNAL_ERROR,
+                ffi::result::IO_ERROR,
                 "校验 ABI 版本",
                 format!("需要 ABI 2，实际 {abi}"),
             ));
@@ -227,13 +233,24 @@ impl SdkHost {
         ] {
             let _ = std::fs::create_dir_all(dir);
         }
+        // SDK 的 HTTP 服务没有“关闭上传”开关：只要 upload_root 存在，就会接受
+        // 未认证的 POST/PUT。这里给它一个独立的临时目录，start 成功后立即删除；
+        // 后续上传请求会得到 400，而 GET 下载仍由 download_root 正常提供。
+        let http_upload_root = Path::new(&settings.upload_root).join(".sdk-http-incoming");
+        std::fs::create_dir_all(&http_upload_root).map_err(|err| {
+            self.abort_start(SdkError::with_detail(
+                ffi::result::INTERNAL_ERROR,
+                "创建 SDK HTTP 上传暂存目录",
+                format!("{}：{err}", http_upload_root.display()),
+            ))
+        })?;
 
         // 字符串参数含 NUL 也要走 abort_start 回收已创建的 context，不能 ? 直接返回。
         let bind = cstring_arg(&settings.bind_address, "bind_address")
             .map_err(|err| self.abort_start(err))?;
         let export_root = cstring_arg(&settings.export_root, "export_root")
             .map_err(|err| self.abort_start(err))?;
-        let upload_root = cstring_arg(&settings.upload_root, "upload_root")
+        let upload_root = cstring_arg(&http_upload_root.to_string_lossy(), "upload_root")
             .map_err(|err| self.abort_start(err))?;
         let http_options = ffi::init_versioned::<ffi::LedsdkHttpOptions>(|o| {
             o.bind_address_utf8 = bind.as_ptr();
@@ -242,7 +259,8 @@ impl SdkHost {
             o.upload_root_utf8 = upload_root.as_ptr();
             o.max_upload_size = 1024 * 1024 * 1024;
             o.request_timeout_ms = 30_000;
-            o.flags = ffi::http_flag::ALLOW_RANGE | ffi::http_flag::ALLOW_ABSOLUTE_PATH;
+            // 绝对路径 flag 会让未认证的 18080 变成任意文件读取服务，必须保持关闭。
+            o.flags = ffi::http_flag::ALLOW_RANGE;
         });
         let mut http: Handle = ffi::NULL_HANDLE;
         let rc = unsafe { ffi::ledsdk_http_create(context, &http_options, &mut http) };
@@ -261,6 +279,17 @@ impl SdkHost {
         if rc != ffi::result::OK {
             return Err(self.abort_start(SdkError::new(rc, "ledsdk_http_get_status")));
         }
+        if let Err(err) = remove_http_upload_root(&http_upload_root) {
+            return Err(self.abort_start(SdkError::with_detail(
+                ffi::result::INTERNAL_ERROR,
+                "关闭 SDK HTTP 上传目录",
+                format!(
+                    "{} 无法删除，18080 将保持可写：{err}",
+                    http_upload_root.display()
+                ),
+            )));
+        }
+        info!("SDK HTTP 上传入口已禁用（启动后删除 upload_root）。");
         {
             let mut guard = self.lock();
             guard.http_running = status.running != 0;
@@ -464,7 +493,10 @@ impl SdkHost {
         match signal.wait(timeout) {
             Some(outcome) => Ok(outcome),
             None => {
-                warn!("{operation} 任务超时（{} 秒），请求取消并等待终态。", timeout.as_secs());
+                warn!(
+                    "{operation} 任务超时（{} 秒），请求取消并等待终态。",
+                    timeout.as_secs()
+                );
                 // task_cancel 只是「请求」，完成仍通过回调报告（见 ledsdk.h:641）。
                 // 关键：返回前必须等到终态（task_get_status 轮询）。否则 pipeline 的
                 // finally 会 playlist_release 掉整棵树，而 SDK 导出线程仍持该句柄 → UAF。
@@ -472,8 +504,7 @@ impl SdkHost {
                 let grace = Duration::from_secs(30);
                 if wait_until(
                     || {
-                        let mut status =
-                            ffi::init_versioned::<ffi::LedsdkTaskStatus>(|_| {});
+                        let mut status = ffi::init_versioned::<ffi::LedsdkTaskStatus>(|_| {});
                         let rc = unsafe { ffi::ledsdk_task_get_status(task, &mut status) };
                         rc == ffi::result::OK && ffi::task_state::is_terminal(status.state)
                     },
@@ -495,6 +526,9 @@ impl SdkHost {
     }
 
     pub fn runtime_status(&self) -> Option<ffi::LedsdkRuntimeStatus> {
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return None;
+        }
         let context = self.context();
         if context.is_null() {
             return None;
@@ -504,9 +538,20 @@ impl SdkHost {
         (rc == ffi::result::OK).then_some(status)
     }
 
-    pub fn shutdown(&self) {
+    /// 返回 true 表示 SDK 已完整释放；false 表示有任务/搜索未停下，
+    /// 为避免释放仍被原生线程使用的句柄，本次放弃清理，交给进程 watchdog 强退。
+    pub fn shutdown(&self) -> bool {
+        if self.closed.load(Ordering::SeqCst) {
+            return true;
+        }
         // 先置位：此后提交/快照直接失败，不再碰即将释放的句柄。
-        self.shutting_down.store(true, Ordering::SeqCst);
+        if self.shutting_down.swap(true, Ordering::SeqCst) {
+            // 另一个线程正在关闭；等它完成，避免重复释放。
+            return wait_until(
+                || self.closed.load(Ordering::SeqCst),
+                Duration::from_secs(10),
+            );
+        }
         // 关键：在同一把锁里把 search/http 摘成 NULL 再释放。snapshot_devices 也是
         // 持锁枚举的：它要么在我们摘句柄前完成，要么之后看到 NULL 直接返回，
         // 绝不会拿到一个正在被 release 的悬空句柄。context 保留到关闭末尾，供
@@ -520,14 +565,16 @@ impl SdkHost {
             handles
         };
         if context.is_null() {
-            return;
+            self.closed.store(true, Ordering::SeqCst);
+            return true;
         }
 
         if !search.is_null() {
             unsafe { ffi::ledsdk_search_cancel(search) };
             // cancel 之后任务还要收尾，立刻 release 会得到 INVALID_STATE。
             if !wait_until(|| self.search_task_count() == 0, Duration::from_secs(3)) {
-                warn!("搜索任务 3 秒内未停止，继续释放。");
+                warn!("搜索任务 3 秒内未停止，放弃本次 SDK 清理（交给进程 watchdog）。");
+                return false;
             }
             unsafe { ffi::ledsdk_search_release(search) };
             self.lock().search = ffi::NULL_HANDLE;
@@ -546,10 +593,12 @@ impl SdkHost {
             rx.recv_timeout(Duration::from_secs(3)).is_ok()
         };
         if !cancel {
-            warn!("task_cancel_all 3 秒内未返回，继续关闭。");
+            warn!("task_cancel_all 3 秒内未返回，放弃本次 SDK 清理（交给进程 watchdog）。");
+            return false;
         }
         if !wait_until(|| self.active_task_count() == 0, Duration::from_secs(3)) {
-            warn!("仍有任务未结束，继续关闭。");
+            warn!("仍有任务未结束，放弃本次 SDK 清理（交给进程 watchdog）。");
+            return false;
         }
 
         if !http.is_null() {
@@ -581,15 +630,21 @@ impl SdkHost {
             let mut guard = self.lock();
             guard.context = ffi::NULL_HANDLE;
         }
+        self.closed.store(true, Ordering::SeqCst);
         info!("SDK 已关闭。");
+        true
     }
 
     fn search_task_count(&self) -> u32 {
-        self.runtime_status().map(|s| s.search_task_count).unwrap_or(0)
+        self.runtime_status()
+            .map(|s| s.search_task_count)
+            .unwrap_or(0)
     }
 
     fn active_task_count(&self) -> u32 {
-        self.runtime_status().map(|s| s.active_task_count).unwrap_or(0)
+        self.runtime_status()
+            .map(|s| s.active_task_count)
+            .unwrap_or(0)
     }
 }
 
@@ -609,6 +664,13 @@ fn wait_until(mut done: impl FnMut() -> bool, timeout: Duration) -> bool {
             return false;
         }
         std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn remove_http_upload_root(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        result => result,
     }
 }
 

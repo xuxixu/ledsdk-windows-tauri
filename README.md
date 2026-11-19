@@ -4,11 +4,11 @@ LED 控制卡节目上传服务，用 **Rust + Tauri 2** 重构自同目录的 C
 
 进程同时做三件事：
 
-1. 开机加载 `LedSDK.dll`（校验 ABI 2），启动 SDK 的 HTTP 文件服务（默认 `0.0.0.0:18080`，根目录=导出目录）；
+1. 按配置的 `Sdk.BinDirectory` 动态加载 LedSDK（校验 ABI 2），启动 SDK 的 HTTP 文件服务（默认 `0.0.0.0:18080`，根目录=导出目录）；
 2. 常驻搜索设备（每 2 秒一轮 UDP 40000 广播，仅用于发现与发送前核对）；屏幕清单只在点「扫描」时写回配置文件；
 3. 起 HTTP 上传接口（默认 `0.0.0.0:5180`）：收到「JSON + 素材文件」后建节目树 → 校验 → 导出 `.zhl` → 整文件 MD5 → `send_program` 发到指定屏幕（设备再回拉本机 HTTP 的节目包）。
 
-Tauri 窗口只是只读面板：状态、屏幕清单、最近作业、运行日志，以及打开配置/导出/日志目录（只允许打开这四类目录，其它路径会被拒绝）。
+Tauri 窗口是管理/监控面板：状态、屏幕清单（扫描/编辑/删除）、最近作业、运行日志，以及打开配置/导出/日志目录（只允许打开这四类目录，其它路径会被拒绝）。
 
 ## 目录结构
 
@@ -22,7 +22,7 @@ LedSdk_windows_Tauri/
 │  └─ linux-x64/               Linux：libLedSDK.so{,.1,.1.0.0}、LedSDKTextRenderer、ledsdk.h
 ├─ src/
 │  ├─ main.rs                  Tauri 装配、窗口命令、--selfcheck/--simulate 入口
-│  ├─ ffi.rs                   头文件对应的 extern "C" 声明、结构体、常量
+│  ├─ ffi.rs                   头文件对应的结构体/常量、动态加载的 SDK 函数表
 │  ├─ host.rs                  SdkHost：初始化/搜索快照/导出/发送/关闭顺序
 │  ├─ pipeline.rs              单个上传作业的全流程（建树→校验→导出→校验包→发送）
 │  ├─ jobs.rs                  单消费者作业队列 + 作业表
@@ -63,12 +63,16 @@ LedSdk_windows_Tauri/
 
 | 键 | 默认 | 说明 |
 | --- | --- | --- |
-| `Sdk.BinDirectory` | `..` | `LedSDK.dll` 所在目录。`..` 指配置文件上一级 = exe 目录（build.rs 已把 `sdk/x64` 的文件复制到那里） |
+| `Sdk.BinDirectory` | `..` | LedSDK 动态库所在目录；运行时由 `libloading` 按该路径加载。`..` 指配置文件上一级 = exe 目录（build.rs 已把 `sdk/x64` 的文件复制到那里） |
 | `Sdk.BindAddress` | `0.0.0.0` | SDK HTTP 服务绑定地址 |
 | `Sdk.DownloadPort` | `18080` | 设备回拉节目包用的端口 |
 | `Sdk.ExportRoot` | `../export` | 导出目录，同时是 HTTP 下载根目录 |
 | `Sdk.UploadRoot` | `../upload` | 上传暂存的落盘目录（作业结束即删） |
 | `Sdk.TranscodeCacheRoot` | `../cache` | 视频/GIF 转码缓存 |
+
+> 18080 只用于设备回拉节目包。SDK 的 HTTP 服务本身没有“关闭上传”开关，程序启动后会删除其独立的
+> `.sdk-http-incoming` 目录，使 POST/PUT 返回 400；同时不启用 `ALLOW_ABSOLUTE_PATH`，无法通过
+> `/d:/...` 读取下载根目录之外的文件。不要手工重建该目录，也不要把 `ExportRoot`/`UploadRoot` 配成同一目录。
 | `Sdk.WorkerCount` | `2` | SDK 工作线程数 |
 | `Sdk.DefaultDurationSeconds` / `DefaultRepeatTimes` | `5` / `1` | 文本与图片素材的默认播放时长/次数 |
 | `Sdk.SendRetryCount` / `SendRetryBackoffMs` | `2` / `500` | 发送重试 |
@@ -96,7 +100,7 @@ cargo build --release       # 产物 target\release\ledsdk-tauri.exe
 无窗口自检 / 模拟测试（不依赖数据库、不需要真实设备）：
 
 ```powershell
-.\target\debug\ledsdk-tauri.exe --selfcheck   # 14 个结构体尺寸 + ABI 2 + 清单编辑 10 项 + 节目包校验 7 项 + 异常日志 6 项 + 保留清理 10 项 + 启停生命周期
+.\target\debug\ledsdk-tauri.exe --selfcheck   # 结构体尺寸 + ABI 2 + 清单/备份恢复 + 节目包校验 + 异常日志 + 保留清理 + SDK HTTP 隔离 + 启停生命周期
 .\target\debug\ledsdk-tauri.exe --simulate    # 3 台屏幕 × 文字/图片/视频/GIF + 大文件上传 + 无 token 401 + 作业中关闭（仅 debug 版）
 ```
 
@@ -108,7 +112,7 @@ cargo build --release       # 产物 target\release\ledsdk-tauri.exe
 ## Linux 构建（功能与 Windows 版一致）
 
 厂商提供了 Linux x64 SDK（`libLedSDK.so` + `LedSDKTextRenderer`），本项目已内置到 `sdk/linux-x64/`，
-构建时自动链接、运行时与可执行文件同目录加载，行为与 Windows 版一致（建树 / 校验 / 导出 / 发送全部可用）。
+运行时按 `Sdk.BinDirectory` 动态加载，行为与 Windows 版一致（建树 / 校验 / 导出 / 发送全部可用）。
 
 ```bash
 # SDK 运行依赖：Qt6 运行库（文本渲染器）、FFmpeg（转码与探测）、中文字体
@@ -127,7 +131,7 @@ cargo build --release
 > `wsl.exe -u root -e bash /mnt/d/Project/LedSdk_windows_Tauri/build-linux-verify.sh`
 
 `target/release/` 里除了可执行文件，还会有 `libLedSDK.so{,.1,.1.0.0}`、`LedSDKTextRenderer` 和 `config/appsettings.json`：
-`build.rs` 通过 `-Wl,-rpath,$ORIGIN` 让程序在自身目录找这个 SO，`LedSDKTextRenderer` 必须与它同目录（SDK 的要求）。
+`build.rs` 负责把 SO 复制到目标目录；运行时通过 `libloading` 按 `Sdk.BinDirectory` 的绝对路径加载，`LedSDKTextRenderer` 必须与它同目录（SDK 的要求）。
 
 > 从 Windows 拷贝过来的仓库会丢掉执行位：`build.rs` 复制到 `target/` 时会为 `LedSDKTextRenderer` 补 `755`；
 > 如果直接在仓库目录里运行，先 `chmod +x sdk/linux-x64/LedSDKTextRenderer`。
@@ -142,7 +146,7 @@ cargo build --release
 | 子进程兜底 | Windows 作业对象（崩溃连带结束 ffmpeg） | 无（依赖正常退出时取消任务） |
 | 开机自启 | HKCU Run 注册表 | 未实现（建议 systemd user unit） |
 
-`src/ffi.rs` 的 `sdk_api!` 宏在 Windows / Linux 上展开成真实的 `#[link(name = "LedSDK")] extern "C"`，
+`src/ffi.rs` 的 `sdk_api!` 宏在 Windows / Linux 上展开成动态加载的函数指针调用，
 其它平台展开成返回 `NOT_SUPPORTED(-11)` 的桩；`SdkHost::available()` 只在 Windows / Linux 返回 true，
 其它平台 `GET /api/health` 报 `sdkAvailable: false`、`POST /api/program` 返回 503。
 
@@ -155,7 +159,7 @@ cargo build --release
 不能建树 / 导出 / 发送。表现：
 
 - `GET /api/health` 返回 `sdkAvailable: false`；界面状态行显示「SDK 不可用（本平台没有 LedSDK）」。
-- `POST /api/program` 与 `POST /api/screens/{deviceId}/geometry` 返回 503，并说明原因。
+- `POST /api/program` 返回 503，并说明原因；几何接口不依赖 SDK，仍可补录。
 - `--selfcheck` 跳过 SDK 版本与生命周期检查；`--simulate` 打印提示后退出（macOS 无 SDK）。
 - 「打开目录」按钮在 macOS 用 `open` 而不是 Linux 的 `xdg-open`。
 
@@ -212,8 +216,9 @@ curl.exe -X POST http://127.0.0.1:5180/api/program `
 
 作业是异步的：上传返回 `202` + 首个状态，之后轮询 `/api/jobs/{jobId}` 到 `Succeeded` / `Failed`。
 
-- 请求体上限 1 GB（`DefaultBodyLimit`）。素材是边收边写磁盘的，大文件不会整块进内存；作业失败或请求被拒时半截文件会被清掉。
+- 请求体上限 1 GB（`DefaultBodyLimit`，`Content-Length` 超限会提前 413）。素材是边收边写磁盘的，大文件不会整块进内存；作业失败或请求被拒时半截文件会被清掉。
 - `request` 字段（JSON）上限 64 KB，超过返回 400「request 字段过大」。一次请求带多个 file 字段时只保留最后一个，先落盘的那个会被删掉。
+- 等待执行的作业上限 64 个；队列满时上传接口返回失败状态并清理暂存文件，避免无限堆积。
 - 配了 `UploadApi.Token` 时，`POST /api/program` 与 `POST /api/screens/{deviceId}/geometry` 需要 `Authorization: Bearer <token>`，缺失返回 401。
 - Swagger：`http://127.0.0.1:5180/swagger-ui/#/`（OpenAPI JSON 在 `/api-docs/openapi.json`）。
 - 窗口里配了 CSP（`tauri.conf.json` → `app.security.csp`）。注意 `script-src` 必须带 `'unsafe-inline'`：Tauri 会往页面注入内联的 IPC 引导脚本，去掉它窗口会变成极小尺寸且不渲染。`connect-src` 必须保留 `ipc: http://ipc.localhost`，否则 `invoke` 全部失败。
@@ -257,15 +262,15 @@ curl.exe -X POST http://127.0.0.1:5180/api/program `
 .\dist.ps1     # cargo build --release + 把 exe / config / sdk\x64 / README 拷到 dist\
 ```
 
-`dist.ps1` 不清理 `dist\` 里的旧文件（删除需人工确认）；上游文件改名后请手动删残留。
+`dist.ps1` 不清理 `dist\` 里的旧文件（删除需人工确认）；已有的 `dist\config\appsettings.json` 不会被覆盖，模板另存为 `appsettings.template.json`。上游文件改名后请手动删残留。
 
 ## 验证状态
 
 | 项 | 结果 |
 | --- | --- |
 | `cargo build` / `cargo build --release` | 0 警告 0 错误 |
-| `--selfcheck` | 14/14 结构体尺寸、`LedSDK 1.0.0 (ABI 2)`、清单编辑 10 项、节目包校验 7 项、异常日志 6 项、保留清理 10 项、生命周期通过 |
-| `--simulate` | 70 项断言通过（3 屏 × 文字/图片/视频/GIF + 4.1 MB 大文件上传 + 无 token/错 token 401 + 作业中关闭 0.3 秒） |
+| `--selfcheck` | 14/14 结构体尺寸、`LedSDK 1.0.0 (ABI 2)`、清单编辑/坏配置恢复、节目包校验、异常日志、保留清理、SDK HTTP 隔离、生命周期通过 |
+| `--simulate` | 85 项断言通过（3 屏 × 文字/单行文字/图片/视频/GIF + 4.1 MB 大文件上传 + 无 token/错 token 401 + 作业中关闭） |
 | 上传上限 | 3 MB / 4.1 MB 上传均正常（旧实现被 axum 默认 2 MB 挡掉） |
 | 接口鉴权 | `UploadApi.Token` 非空时缺 `Authorization` 返回 401 |
 | 桌面窗口 | 标题栏正常、状态/屏幕/作业/日志四块渲染正常（CSP 开启后复核） |

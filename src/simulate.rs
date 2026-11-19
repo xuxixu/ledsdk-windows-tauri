@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use crate::config::{AppHostSettings, AppSettings, ScreenProfile, ScreenSource, SdkSettings, UploadApiSettings};
+use crate::config::{
+    AppHostSettings, AppSettings, ScreenProfile, ScreenSource, SdkSettings, UploadApiSettings,
+};
 
 const API_ADDR: &str = "127.0.0.1:5199";
 const DOWNLOAD_PORT: u16 = 28081;
@@ -59,10 +61,14 @@ pub fn run() -> i32 {
         listen_address: "127.0.0.1".to_string(),
         port: 5199,
         token: Some(SIM_TOKEN.to_string()),
+        upload_api_status: runtime.upload_api_status.clone(),
     };
     let http_shutdown = runtime.http_shutdown.clone();
     std::thread::spawn(move || {
-        let tokio_runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+        let tokio_runtime = match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+        {
             Ok(runtime) => runtime,
             Err(err) => {
                 println!("创建异步运行时失败：{err}");
@@ -82,8 +88,9 @@ pub fn run() -> i32 {
 
     let mut passed = 0;
     let mut failed = 0;
-    let cases: [(&str, &str, PathBuf); 4] = [
+    let cases: [(&str, &str, PathBuf); 5] = [
         ("text", "text", assets.text.clone()),
+        ("text-single", "text", assets.text_single.clone()),
         ("picture", "picture", assets.picture.clone()),
         ("video", "video", assets.video.clone()),
         ("gif", "gif", assets.gif.clone()),
@@ -108,8 +115,17 @@ pub fn run() -> i32 {
     }
 
     // 未知设备必须被拒绝。
-    match post_program("no-such-device", "picture", &assets.picture, 0, 0, 64, 64, &run_dir) {
-        Ok((status, _)) if status == 400 => {
+    match post_program(
+        "no-such-device",
+        "picture",
+        &assets.picture,
+        0,
+        0,
+        64,
+        64,
+        &run_dir,
+    ) {
+        Ok((400, _)) => {
             passed += 1;
             println!("  [ok] 未知设备返回 400");
         }
@@ -181,11 +197,22 @@ pub fn run() -> i32 {
     }
 
     // 大文件上传（> 2 MB）：axum 默认 2 MB 上限会直接 400，必须被 DefaultBodyLimit 放宽。
-    match run_case("sim-device-a", "big", "picture", &assets.big, 256, 256, &run_dir) {
+    match run_case(
+        "sim-device-a",
+        "big",
+        "picture",
+        &assets.big,
+        256,
+        256,
+        &run_dir,
+    ) {
         Ok(checks) => {
             passed += checks;
             let size = std::fs::metadata(&assets.big).map(|m| m.len()).unwrap_or(0);
-            println!("  [ok] 大文件上传（{:.1} MB）", size as f64 / 1024.0 / 1024.0);
+            println!(
+                "  [ok] 大文件上传（{:.1} MB）",
+                size as f64 / 1024.0 / 1024.0
+            );
         }
         Err(err) => {
             failed += 1;
@@ -195,7 +222,16 @@ pub fn run() -> i32 {
 
     // 作业处理中关闭：必须有限时间内返回，不能卡在 SDK 原生调用里。
     let mut stopped = false;
-    match post_program("sim-device-a", "video", &assets.video, 0, 0, 256, 256, &run_dir) {
+    match post_program(
+        "sim-device-a",
+        "video",
+        &assets.video,
+        0,
+        0,
+        256,
+        256,
+        &run_dir,
+    ) {
         Ok((202, _)) => {
             let started = Instant::now();
             let cleaned = runtime.stop();
@@ -244,20 +280,21 @@ pub fn run() -> i32 {
 }
 
 fn simulate_settings(bin_directory: &str, run_dir: &Path) -> AppSettings {
-    let make = |name: &str, device_id: &str, width: i32, height: i32, device_type: u32| ScreenProfile {
-        name: name.to_string(),
-        device_id: device_id.to_string(),
-        ip: String::new(),
-        port: 20003,
-        device_type,
-        width,
-        height,
-        rotate: 0,
-        local_address: String::new(),
-        last_seen: None,
-        online: false,
-        source: ScreenSource::Manual,
-    };
+    let make =
+        |name: &str, device_id: &str, width: i32, height: i32, device_type: u32| ScreenProfile {
+            name: name.to_string(),
+            device_id: device_id.to_string(),
+            ip: String::new(),
+            port: 20003,
+            device_type,
+            width,
+            height,
+            rotate: 0,
+            local_address: String::new(),
+            last_seen: None,
+            online: false,
+            source: ScreenSource::Manual,
+        };
 
     AppSettings {
         sdk: SdkSettings {
@@ -289,6 +326,7 @@ fn simulate_settings(bin_directory: &str, run_dir: &Path) -> AppSettings {
 
 struct Assets {
     text: PathBuf,
+    text_single: PathBuf,
     picture: PathBuf,
     video: PathBuf,
     gif: PathBuf,
@@ -302,6 +340,8 @@ fn generate_assets(bin_directory: &Path, run_dir: &Path) -> Result<Assets, Strin
 
     let text = assets_dir.join("text.txt");
     std::fs::write(&text, "LedSdk Rust 模拟测试\n第二行文字").map_err(|err| err.to_string())?;
+    let text_single = assets_dir.join("text-single.txt");
+    std::fs::write(&text_single, "LedSdk Rust 单行文本").map_err(|err| err.to_string())?;
 
     // Windows 用包里自带的 ffmpeg.exe；Linux 按 SDK 文档从 PATH 找系统 ffmpeg。
     let ffmpeg = if cfg!(windows) {
@@ -309,7 +349,7 @@ fn generate_assets(bin_directory: &Path, run_dir: &Path) -> Result<Assets, Strin
         if !bundled.exists() {
             return Err(format!("未找到 {}", bundled.display()));
         }
-        std::path::PathBuf::from(bundled)
+        bundled
     } else {
         std::path::PathBuf::from("ffmpeg")
     };
@@ -321,39 +361,76 @@ fn generate_assets(bin_directory: &Path, run_dir: &Path) -> Result<Assets, Strin
 
     run_ffmpeg(
         &ffmpeg,
-        &["-y", "-f", "lavfi", "-i", "color=c=blue:size=200x120", "-frames:v", "1", &picture.to_string_lossy()],
+        &[
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=blue:size=200x120",
+            "-frames:v",
+            "1",
+            &picture.to_string_lossy(),
+        ],
     )?;
     run_ffmpeg(
         &ffmpeg,
         &[
-            "-y", "-f", "lavfi", "-i", "testsrc2=size=256x256:rate=15:duration=2",
-            "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
-            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=256x256:rate=15:duration=2",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=2",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-shortest",
             &video.to_string_lossy(),
         ],
     )?;
     run_ffmpeg(
         &ffmpeg,
         &[
-            "-y", "-f", "lavfi", "-i", "testsrc2=size=256x256:rate=10",
-            "-frames:v", "20", &gif.to_string_lossy(),
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=256x256:rate=10",
+            "-frames:v",
+            "20",
+            &gif.to_string_lossy(),
         ],
     )?;
     // testsrc2 本身有噪声，1600x1200 的 PNG 通常 4 MB 以上，确保超过 2 MB 的默认上限。
     run_ffmpeg(
         &ffmpeg,
         &[
-            "-y", "-f", "lavfi", "-i", "testsrc2=size=1600x1200:rate=1,noise=alls=100:allf=t+u",
-            "-frames:v", "1", &big.to_string_lossy(),
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=1600x1200:rate=1,noise=alls=100:allf=t+u",
+            "-frames:v",
+            "1",
+            &big.to_string_lossy(),
         ],
     )?;
     let big_size = std::fs::metadata(&big).map(|m| m.len()).unwrap_or(0);
     if big_size < 3 * 1024 * 1024 {
-        return Err(format!("大文件素材只有 {big_size} 字节，不够验证 >2 MB 上传"));
+        return Err(format!(
+            "大文件素材只有 {big_size} 字节，不够验证 >2 MB 上传"
+        ));
     }
 
     Ok(Assets {
         text,
+        text_single,
         picture,
         video,
         gif,
@@ -369,7 +446,10 @@ fn run_ffmpeg(ffmpeg: &Path, args: &[&str]) -> Result<(), String> {
     if !output.status.success() {
         return Err(format!(
             "ffmpeg 失败：{}",
-            String::from_utf8_lossy(&output.stderr).lines().last().unwrap_or("")
+            String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .last()
+                .unwrap_or("")
         ));
     }
     Ok(())
@@ -453,6 +533,7 @@ fn json_field(body: &str, field: &str) -> Option<String> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn post_program(
     device_id: &str,
     file_type: &str,
@@ -482,7 +563,10 @@ fn post_program(
 
     let boundary = format!("----ledsdk{:x}", crate::jobs::new_id().len());
     let mut body = Vec::new();
-    body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"request\"\r\n\r\n").as_bytes());
+    body.extend_from_slice(
+        format!("--{boundary}\r\nContent-Disposition: form-data; name=\"request\"\r\n\r\n")
+            .as_bytes(),
+    );
     body.extend_from_slice(request_json.as_bytes());
     body.extend_from_slice(
         format!(
@@ -532,7 +616,14 @@ fn request_bad_token(
     content_type: Option<&str>,
     body: &[u8],
 ) -> std::io::Result<(u16, String)> {
-    send(address, method, path, content_type, body, Some("wrong-token"))
+    send(
+        address,
+        method,
+        path,
+        content_type,
+        body,
+        Some("wrong-token"),
+    )
 }
 
 fn send(

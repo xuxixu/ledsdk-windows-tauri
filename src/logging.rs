@@ -32,7 +32,8 @@ impl FileLogger {
     }
 
     fn write_line(&self, level: Level, target: &str, message: &str) {
-        let now = time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+        let now =
+            time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
         let day = format!(
             "{:04}-{:02}-{:02}",
             now.year(),
@@ -53,10 +54,7 @@ impl FileLogger {
         let line = format!("{stamp} [{}] {target} : {message}\n", tag(level));
 
         // 锁中毒（持锁期间 panic）不能把之后的日志全丢掉：恢复内部值继续写。
-        let mut guard = self
-            .inner
-            .lock()
-            .unwrap_or_else(|err| err.into_inner());
+        let mut guard = self.inner.lock().unwrap_or_else(|err| err.into_inner());
 
         let rotate = match guard.as_ref() {
             Some((current, _)) => current != &day,
@@ -193,9 +191,7 @@ fn install_panic_hook() {
             .to_string();
         // force_capture 不受 RUST_BACKTRACE 影响，发行版里也能拿到调用栈。
         let backtrace = std::backtrace::Backtrace::force_capture();
-        let text = format!(
-            "未捕获异常：{payload}\n线程：{thread}\n位置：{location}\n{backtrace}"
-        );
+        let text = format!("未捕获异常：{payload}\n线程：{thread}\n位置：{location}\n{backtrace}");
         record_exception_global("PANIC", &text);
         previous(info);
     }));

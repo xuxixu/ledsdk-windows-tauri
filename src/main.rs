@@ -24,7 +24,7 @@ mod winos;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use log::{error, info};
+use log::{error, info, warn};
 use tauri::{Manager, RunEvent, State};
 
 type SharedRuntime = Arc<runtime::Runtime>;
@@ -46,6 +46,8 @@ fn get_status(runtime: State<'_, SharedRuntime>) -> serde_json::Value {
             net::browsable_address(&runtime.registry.settings().upload_api.listen_address),
             api_port(runtime.as_ref())
         ),
+        "uploadApiRunning": runtime.upload_api_status.running(),
+        "uploadApiError": runtime.upload_api_status.error(),
         "configPath": runtime.config_path.to_string_lossy(),
         "exportRoot": settings.export_root,
         "logDirectory": runtime.log_directory.to_string_lossy(),
@@ -58,7 +60,8 @@ fn api_port(runtime: &runtime::Runtime) -> u16 {
 
 fn screens_json(runtime: &runtime::Runtime) -> serde_json::Value {
     // 与 HTTP `/api/screens` 共用同一个视图结构，避免两套字段口径。
-    serde_json::to_value(server::screen_views(&runtime.registry)).unwrap_or_else(|_| serde_json::json!([]))
+    serde_json::to_value(server::screen_views(&runtime.registry))
+        .unwrap_or_else(|_| serde_json::json!([]))
 }
 
 #[tauri::command]
@@ -166,7 +169,9 @@ fn main() {
         exit_now(simulate::run());
         #[cfg(not(all(any(windows, target_os = "linux"), debug_assertions)))]
         {
-            eprintln!("--simulate 只在 debug 版本提供（发行版不含模拟测试，请用 --selfcheck 自检）。");
+            eprintln!(
+                "--simulate 只在 debug 版本提供（发行版不含模拟测试，请用 --selfcheck 自检）。"
+            );
             exit_now(2);
         }
     }
@@ -197,18 +202,25 @@ fn main() {
                 listen_address: settings.upload_api.listen_address.clone(),
                 port: settings.upload_api.port,
                 token: Some(settings.upload_api.token.clone()).filter(|token| !token.is_empty()),
+                upload_api_status: runtime.upload_api_status.clone(),
             };
             let http_shutdown = runtime.http_shutdown.clone();
+            let api_status = runtime.upload_api_status.clone();
             std::thread::spawn(move || {
-                let tokio_runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+                let tokio_runtime = match tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                {
                     Ok(runtime) => runtime,
                     Err(err) => {
                         error!("创建异步运行时失败：{err}");
+                        api_status.mark_failed(format!("创建异步运行时失败：{err}"));
                         return;
                     }
                 };
                 if let Err(err) = tokio_runtime.block_on(server::serve(state, http_shutdown)) {
                     error!("上传接口异常退出：{err}");
+                    api_status.mark_failed(format!("上传接口异常退出：{err}"));
                 }
             });
 
@@ -240,8 +252,11 @@ fn main() {
                         eprintln!("关闭超时，强制退出进程。");
                         std::process::exit(0);
                     });
-                    runtime.stop();
-                    info!("关闭完成，退出进程。");
+                    if runtime.stop() {
+                        info!("关闭完成，退出进程。");
+                    } else {
+                        warn!("关闭未完全完成，等待 watchdog 强制退出。");
+                    }
                 }
             }
         });

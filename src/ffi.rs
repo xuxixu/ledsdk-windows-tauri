@@ -25,6 +25,7 @@ pub mod result {
     pub const INVALID_ARGUMENT: i32 = -1;
     pub const INVALID_STATE: i32 = -4;
     pub const NOT_SUPPORTED: i32 = -11;
+    pub const IO_ERROR: i32 = -12;
     pub const BUFFER_TOO_SMALL: i32 = -17;
     pub const INTERNAL_ERROR: i32 = -100;
 }
@@ -91,11 +92,13 @@ pub mod effect {
 // 结构体
 // ---------------------------------------------------------------------------
 
-pub type LogCallback = Option<unsafe extern "C" fn(level: u32, message: *const c_char, user: *mut c_void)>;
+pub type LogCallback =
+    Option<unsafe extern "C" fn(level: u32, message: *const c_char, user: *mut c_void)>;
 pub type TaskCallback =
     Option<unsafe extern "C" fn(task: Handle, event: *const LedsdkTaskEvent, user: *mut c_void)>;
-pub type DeviceCallback =
-    Option<unsafe extern "C" fn(search: Handle, device: *const LedsdkDeviceInfo, user: *mut c_void)>;
+pub type DeviceCallback = Option<
+    unsafe extern "C" fn(search: Handle, device: *const LedsdkDeviceInfo, user: *mut c_void),
+>;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -330,12 +333,72 @@ pub fn init_versioned<T>(fill: impl FnOnce(&mut T)) -> T {
 macro_rules! sdk_api {
     ($( pub fn $name:ident($($arg:ident: $ty:ty),* $(,)?) -> i32; )*) => {
         #[cfg(any(windows, target_os = "linux"))]
-        #[link(name = "LedSDK")]
-        extern "C" {
-            $( pub fn $name($($arg: $ty),*) -> i32; )*
+        pub mod dynamic {
+            use std::path::Path;
+            use std::sync::OnceLock;
+
+            use libloading::Library;
+
+            use super::*;
+
+            /// 动态加载的 SDK 函数表。函数指针本身是 Copy/Send/Sync，
+            /// 只要 `LIBRARY` 还活着，指针就一直有效。
+            pub struct Api {
+                $(pub $name: unsafe extern "C" fn($($ty),*) -> i32,)*
+            }
+
+            static LIBRARY: OnceLock<Result<Library, String>> = OnceLock::new();
+            static API: OnceLock<Api> = OnceLock::new();
+
+            impl Api {
+                unsafe fn from_library(library: &Library) -> Result<Self, String> {
+                    Ok(Self {
+                        $(
+                            $name: *library
+                                .get::<unsafe extern "C" fn($($ty),*) -> i32>(
+                                    concat!(stringify!($name), "\0").as_bytes(),
+                                )
+                                .map_err(|err| {
+                                    format!("缺少符号 {}：{err}", stringify!($name))
+                                })?,
+                        )*
+                    })
+                }
+            }
+
+            /// 按配置中的 BinDirectory 加载 SDK；重复调用是幂等的。
+            pub fn load(path: &Path) -> Result<(), String> {
+                let library = match LIBRARY.get_or_init(|| unsafe {
+                    Library::new(path)
+                        .map_err(|err| format!("加载 {} 失败：{err}", path.display()))
+                }) {
+                    Ok(library) => library,
+                    Err(err) => return Err(err.clone()),
+                };
+                if API.get().is_some() {
+                    return Ok(());
+                }
+                let api = unsafe { Api::from_library(library)? };
+                API.set(api)
+                    .map_err(|_| "LedSDK API 重复初始化".to_string())?;
+                Ok(())
+            }
+
+            pub fn is_loaded() -> bool {
+                API.get().is_some()
+            }
+
+            pub(super) fn api() -> &'static Api {
+                API.get().expect("LedSDK 尚未加载")
+            }
         }
 
         $(
+            #[cfg(any(windows, target_os = "linux"))]
+            pub unsafe fn $name($($arg: $ty),*) -> i32 {
+                (dynamic::api().$name)($($arg),*)
+            }
+
             #[cfg(not(any(windows, target_os = "linux")))]
             #[no_mangle]
             pub unsafe extern "C" fn $name($($arg: $ty),*) -> i32 {
@@ -344,6 +407,35 @@ macro_rules! sdk_api {
             }
         )*
     };
+}
+
+#[cfg(any(windows, target_os = "linux"))]
+pub use dynamic::{is_loaded, load};
+
+#[cfg(not(any(windows, target_os = "linux")))]
+pub fn is_loaded() -> bool {
+    false
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+pub fn load(_path: &std::path::Path) -> Result<(), String> {
+    Err("本平台没有 LedSDK（仅 Windows x64 / Linux x64）".to_string())
+}
+
+/// 当前平台 SDK 动态库文件名。
+pub fn library_name() -> &'static str {
+    #[cfg(windows)]
+    {
+        "LedSDK.dll"
+    }
+    #[cfg(target_os = "linux")]
+    {
+        "libLedSDK.so.1"
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        "LedSDK"
+    }
 }
 
 sdk_api! {
@@ -531,11 +623,17 @@ pub fn is_success(result: i32) -> bool {
 
 /// 结果码 → 文本（调用方缓冲区 + required_size 重分配）。
 pub fn result_message(result: i32) -> String {
+    if !is_loaded() {
+        return format!("result={result}");
+    }
     read_into_buffer(|buf, cap, req| unsafe { ledsdk_result_message(result, buf, cap, req) })
 }
 
 /// 读取 context 上最近一次错误（同上）。
 pub fn last_error(context: Handle) -> String {
+    if !is_loaded() {
+        return String::new();
+    }
     read_into_buffer(|buf, cap, req| unsafe { ledsdk_get_last_error(context, buf, cap, req) })
 }
 
@@ -543,11 +641,19 @@ pub fn last_error(context: Handle) -> String {
 pub fn read_into_buffer(mut call: impl FnMut(*mut c_char, u32, *mut u32) -> i32) -> String {
     let mut required: u32 = 0;
     let mut buffer = vec![0u8; 1024];
-    let mut rc = call(buffer.as_mut_ptr() as *mut c_char, buffer.len() as u32, &mut required);
+    let mut rc = call(
+        buffer.as_mut_ptr() as *mut c_char,
+        buffer.len() as u32,
+        &mut required,
+    );
 
     if rc == result::BUFFER_TOO_SMALL && required > buffer.len() as u32 {
         buffer = vec![0u8; required as usize];
-        rc = call(buffer.as_mut_ptr() as *mut c_char, buffer.len() as u32, &mut required);
+        rc = call(
+            buffer.as_mut_ptr() as *mut c_char,
+            buffer.len() as u32,
+            &mut required,
+        );
     }
 
     if !is_success(rc) {

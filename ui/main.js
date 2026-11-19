@@ -1,6 +1,8 @@
 // 界面：左「屏幕清单」（手动扫描/重载/编辑/删除），右「最近作业 + 运行日志」。
 // 屏幕清单不再自动刷新——只有扫描、重载、编辑、删除后重新读取。
-const invoke = window.__TAURI__.core.invoke;
+const invoke = window.__TAURI__?.core?.invoke ?? (async () => {
+  throw new Error("当前浏览器预览没有 Tauri IPC。");
+});
 
 // 前端未捕获异常也进 errors 日志（对应 Rust 侧的全局 panic hook）。
 // 注意别用 invoke(...).catch 之外的 await，避免监听器本身抛错。
@@ -37,6 +39,12 @@ function setHint(text) {
   document.getElementById("screen-hint").textContent = text;
 }
 
+function statusItem(label, value, dotClass = "") {
+  return `<span class="status-item">${
+    dotClass ? `<span class="status-dot ${dotClass}"></span>` : ""
+  }${escapeHtml(label)}：${escapeHtml(value)}</span>`;
+}
+
 function rowKey(screen) {
   return `${screen.deviceId}||${screen.name}`;
 }
@@ -49,7 +57,7 @@ function renderScreens() {
   document.getElementById("screen-count").textContent = `（${screens.length} 台）`;
   const body = document.getElementById("screens");
   if (!screens.length) {
-    body.innerHTML = `<tr><td colspan="5">还没有屏幕：点「扫描」发现设备，或「重新加载配置」读回手工条目。</td></tr>`;
+    body.innerHTML = `<tr class="empty"><td colspan="5">还没有屏幕：点「扫描」发现设备，或「重新加载配置」读回手工条目。</td></tr>`;
     return;
   }
   body.innerHTML = screens
@@ -188,11 +196,19 @@ async function refreshLive() {
     exportRoot = status.exportRoot;
     logDirectory = status.logDirectory;
 
-    const http = status.httpRunning ? `HTTP ${status.httpPort} 运行中` : "HTTP 未运行";
+    const uploadApi = status.uploadApiRunning
+      ? `${status.apiUrl} 运行中`
+      : `未启动${status.uploadApiError ? `（${status.uploadApiError}）` : ""}`;
     const active = status.activeTaskCount - status.searchTaskCount;
-    document.getElementById("status").textContent =
-      `SDK ${status.sdkAvailable === false ? "不可用（本平台没有 LedSDK）" : status.sdk}　|　${http}　|　上传接口 ${status.apiUrl}　|　` +
-      `屏幕 ${status.screens} 台　|　进行中作业 ${active}（搜索常驻 ${status.searchTaskCount}）`;
+    const statusElement = document.getElementById("status");
+    statusElement.classList.remove("is-error");
+    statusElement.innerHTML = [
+      statusItem("SDK", status.sdkAvailable === false ? "不可用（本平台没有 LedSDK）" : status.sdk, status.sdkAvailable === false ? "bad" : "ok"),
+      statusItem("SDK HTTP", status.httpRunning ? `${status.httpPort} 运行中` : "未运行", status.httpRunning ? "ok" : "bad"),
+      statusItem("上传接口", uploadApi, status.uploadApiRunning ? "ok" : "bad"),
+      statusItem("屏幕", `${status.screens} 台`),
+      statusItem("进行中作业", `${active}（搜索常驻 ${status.searchTaskCount}）`),
+    ].join("");
 
     const jobs = await invoke("list_jobs", { limit: 20 });
     document.getElementById("job-count").textContent = `（最近 ${jobs.length} 条）`;
@@ -202,14 +218,19 @@ async function refreshLive() {
         }${cell(job.deviceId)}${cell(job.fileName)}${cell(job.state, `state-${job.state}`)}${
           cell(job.error || job.message, "wrap")
         }</tr>`).join("")
-      : `<tr><td colspan="5">还没有作业：POST /api/program 提交一次上传。</td></tr>`;
+      : `<tr class="empty"><td colspan="5">还没有作业：POST /api/program 提交一次上传。</td></tr>`;
 
     const logs = await invoke("read_logs", { lines: 200 });
     const box = document.getElementById("logs");
-    box.textContent = logs.length ? logs.join("\n") : "（今天还没有日志）";
-    box.scrollTop = box.scrollHeight;
+    const stickToBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 8;
+    const previousScrollTop = box.scrollTop;
+    box.textContent = logs.length ? logs.join("\n") : "";
+    document.querySelector(".logs").classList.toggle("empty", !logs.length);
+    box.scrollTop = stickToBottom ? box.scrollHeight : previousScrollTop;
   } catch (err) {
-    document.getElementById("status").textContent = `读取状态失败：${err}`;
+    const statusElement = document.getElementById("status");
+    statusElement.classList.add("is-error");
+    statusElement.textContent = `读取状态失败：${err}`;
   }
 }
 

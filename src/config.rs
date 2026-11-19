@@ -94,17 +94,12 @@ impl Default for AppHostSettings {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, utoipa::ToSchema)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ScreenSource {
+    #[default]
     Manual,
     Discovered,
-}
-
-impl Default for ScreenSource {
-    fn default() -> Self {
-        Self::Manual
-    }
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]
@@ -148,30 +143,96 @@ impl SdkSettings {
         self.upload_root = resolve_against(base, &self.upload_root);
         self.transcode_cache_root = resolve_against(base, &self.transcode_cache_root);
     }
+
+    /// 启动前校验路径/端口，避免空路径把清理逻辑指向程序目录。
+    pub fn validate(&self, config_directory: &Path) -> Result<(), String> {
+        if self.download_port == 0 {
+            return Err("Sdk.DownloadPort 必须在 1-65535 之间。".to_string());
+        }
+        if self.bind_address.trim().is_empty() {
+            return Err("Sdk.BindAddress 不能为空。".to_string());
+        }
+        for (name, value) in [
+            ("Sdk.BinDirectory", &self.bin_directory),
+            ("Sdk.ExportRoot", &self.export_root),
+            ("Sdk.UploadRoot", &self.upload_root),
+            ("Sdk.TranscodeCacheRoot", &self.transcode_cache_root),
+        ] {
+            let path = Path::new(value);
+            if value.trim().is_empty() || !path.is_absolute() {
+                return Err(format!("{name} 必须是非空的绝对路径：{value:?}"));
+            }
+        }
+        let config_dir = normalized(config_directory);
+        let export = normalized(Path::new(&self.export_root));
+        let upload = normalized(Path::new(&self.upload_root));
+        let cache = normalized(Path::new(&self.transcode_cache_root));
+        for (name, path) in [
+            ("Sdk.ExportRoot", &export),
+            ("Sdk.UploadRoot", &upload),
+            ("Sdk.TranscodeCacheRoot", &cache),
+        ] {
+            if path == &config_dir {
+                return Err(format!("{name} 不能指向配置目录：{}", path.display()));
+            }
+        }
+        if export == upload || export == cache || upload == cache {
+            return Err("ExportRoot / UploadRoot / TranscodeCacheRoot 必须互相独立。".to_string());
+        }
+        Ok(())
+    }
+}
+
+impl UploadApiSettings {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.port == 0 {
+            return Err("UploadApi.Port 必须在 1-65535 之间。".to_string());
+        }
+        if self.listen_address.trim().is_empty() {
+            return Err("UploadApi.ListenAddress 不能为空。".to_string());
+        }
+        Ok(())
+    }
+}
+
+fn normalized(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 pub fn load_or_default(path: &Path) -> AppSettings {
-    match fs::read_to_string(path) {
-        Ok(text) => match serde_json::from_str::<AppSettings>(&text) {
-            Ok(settings) => {
-                let mut settings = settings;
-                let base = base_dir_of(path);
-                settings.sdk.resolve_paths(&base);
-                settings
+    match read_settings(path) {
+        Ok(settings) => settings,
+        Err(_) if !path.exists() => default_for(path),
+        Err(err) => {
+            // 主文件损坏时优先恢复上一版 .bak，避免直接把屏幕清单清空。
+            let backup = path.with_extension("json.bak");
+            match read_settings(&backup) {
+                Ok(settings) => {
+                    warn!("配置文件解析失败，已从备份恢复：{path:?} → {backup:?}：{err}");
+                    settings
+                }
+                Err(backup_err) => {
+                    error!(
+                        "配置文件与备份均无法解析，使用默认配置继续：{path:?}：{err}；备份：{backup:?}：{backup_err}"
+                    );
+                    default_for(path)
+                }
             }
-            Err(err) => {
-                error!("配置文件解析失败，使用默认配置继续：{path:?}：{err}");
-                let mut settings = AppSettings::default();
-                settings.sdk.resolve_paths(&base_dir_of(path));
-                settings
-            }
-        },
-        Err(_) => {
-            let mut settings = AppSettings::default();
-            settings.sdk.resolve_paths(&base_dir_of(path));
-            settings
         }
     }
+}
+
+fn read_settings(path: &Path) -> Result<AppSettings, String> {
+    let text = fs::read_to_string(path).map_err(|err| err.to_string())?;
+    let mut settings = serde_json::from_str::<AppSettings>(&text).map_err(|err| err.to_string())?;
+    settings.sdk.resolve_paths(&base_dir_of(path));
+    Ok(settings)
+}
+
+fn default_for(path: &Path) -> AppSettings {
+    let mut settings = AppSettings::default();
+    settings.sdk.resolve_paths(&base_dir_of(path));
+    settings
 }
 
 /// 写盘串行化：UI 线程（扫描/编辑）与 HTTP 线程（几何补录）可能同时触发保存。
@@ -222,8 +283,7 @@ pub fn save(path: &Path, settings: &AppSettings) -> io::Result<()> {
     serialized.sdk.bin_directory = relativize(&base, &settings.sdk.bin_directory);
     serialized.sdk.export_root = relativize(&base, &settings.sdk.export_root);
     serialized.sdk.upload_root = relativize(&base, &settings.sdk.upload_root);
-    serialized.sdk.transcode_cache_root =
-        relativize(&base, &settings.sdk.transcode_cache_root);
+    serialized.sdk.transcode_cache_root = relativize(&base, &settings.sdk.transcode_cache_root);
     let text = serde_json::to_string_pretty(&serialized)?;
     // 写之前先自检：反序列化不回去就不落盘，避免写出坏配置。
     serde_json::from_str::<AppSettings>(&text)
@@ -328,6 +388,7 @@ impl ScreenRegistry {
     }
 
     /// 用编辑界面提交的字段更新一条屏幕（DeviceId 不变）。
+    #[allow(clippy::too_many_arguments)]
     pub fn update_screen(
         &self,
         device_id: &str,
@@ -349,7 +410,11 @@ impl ScreenRegistry {
                 .inner
                 .lock()
                 .map_err(|_| "配置被占用，请稍后重试。".to_string())?;
-            let Some(entry) = guard.screens.iter_mut().find(|s| matches(s, device_id, name)) else {
+            let Some(entry) = guard
+                .screens
+                .iter_mut()
+                .find(|s| matches(s, device_id, name))
+            else {
                 return Err("该条目已不在清单中。".to_string());
             };
             let previous = entry.name.clone();
@@ -374,7 +439,11 @@ impl ScreenRegistry {
                 .inner
                 .lock()
                 .map_err(|_| "配置被占用，请稍后重试。".to_string())?;
-            let Some(index) = guard.screens.iter().position(|s| matches(s, device_id, name)) else {
+            let Some(index) = guard
+                .screens
+                .iter()
+                .position(|s| matches(s, device_id, name))
+            else {
                 return Err("该条目已不在清单中。".to_string());
             };
             let removed = guard.screens.remove(index);
@@ -394,7 +463,10 @@ impl ScreenRegistry {
         if let Ok(mut guard) = self.inner.lock() {
             *guard = settings;
         }
-        info!("已从磁盘重新加载配置 {}，共 {count} 台屏幕。", self.path.display());
+        info!(
+            "已从磁盘重新加载配置 {}，共 {count} 台屏幕。",
+            self.path.display()
+        );
         count
     }
 
@@ -439,9 +511,10 @@ fn apply_locked(settings: &mut AppSettings, device: &DeviceSnapshot) -> bool {
         .position(|s| !s.device_id.is_empty() && s.device_id.eq_ignore_ascii_case(device_id))
         .or_else(|| {
             // 人工条目还没被搜索发现过（deviceId 为空）：按 IP + 端口认领。
-            settings.screens.iter().position(|s| {
-                s.device_id.is_empty() && s.ip == device.ip && s.port == device.port
-            })
+            settings
+                .screens
+                .iter()
+                .position(|s| s.device_id.is_empty() && s.ip == device.ip && s.port == device.port)
         });
 
     let now = crate::models::now_iso();

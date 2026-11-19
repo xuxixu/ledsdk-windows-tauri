@@ -8,16 +8,11 @@ fn main() {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let sdk = sdk_directory(&manifest);
 
-    // 两个平台都按 C ABI 链接 SDK：Windows 用 LedSDK.lib + LedSDK.dll，Linux 用 libLedSDK.so。
-    // 其它平台没有 SDK（ffi.rs 里是桩实现），这里不链接也不搬运行文件。
+    // SDK 在运行时按配置的 BinDirectory 动态加载；这里只复制运行文件。
+    // 其它平台没有 SDK（ffi.rs 里是桩实现），不搬运行文件。
     if sdk.exists() {
-        println!("cargo:rustc-link-search=native={}", sdk.display());
         println!("cargo:rerun-if-changed={}", sdk.display());
         copy_runtime(&sdk);
-        if target_os() == "linux" {
-            // 链接期按 SONAME（libLedSDK.so.1）找库：把 rpath 指向可执行文件自身目录。
-            println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
-        }
     }
 
     // 配置模板跟随到输出目录：运行时读写 <exe目录>/config/appsettings.json。
@@ -114,19 +109,16 @@ fn copy_dir(from: &Path, to: &Path) {
 fn set_executable(dst: &Path, src: &Path) {
     if target_os() != "linux" {
         let _ = dst;
-        return;
-    }
-    let is_renderer = src
+    } else if src
         .file_name()
         .map(|name| name == "LedSDKTextRenderer")
-        .unwrap_or(false);
-    if !is_renderer {
-        return;
-    }
-    #[cfg(unix)]
+        .unwrap_or(false)
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::set_permissions(dst, fs::Permissions::from_mode(0o755));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(dst, fs::Permissions::from_mode(0o755));
+        }
     }
 }
 
