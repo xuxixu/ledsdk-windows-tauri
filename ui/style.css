@@ -1,0 +1,217 @@
+:root {
+  color-scheme: light dark;
+  --bg: #f5f6f8;
+  --panel: #ffffff;
+  --text: #1b1f24;
+  --muted: #65707d;
+  --border: #dfe3e8;
+  --accent: #1f6feb;
+  --accent-soft: #e8f0fe;
+  --ok: #1a7f37;
+  --warn: #9a6700;
+  --err: #cf222e;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #16191d;
+    --panel: #1e2228;
+    --text: #e6e9ed;
+    --muted: #9aa4b1;
+    --border: #2c323a;
+    --accent: #4c8dff;
+    --accent-soft: #22314d;
+    --ok: #3fb950;
+    --warn: #d29922;
+    --err: #f85149;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.5 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+}
+
+/* 1 | 2：左屏清单，右「最近作业 + 运行日志」上下堆叠。 */
+#app {
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  gap: 12px;
+  height: 100vh;
+  padding: 14px;
+}
+
+header h1 {
+  margin: 0 0 4px;
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.status {
+  color: var(--muted);
+  font-size: 13px;
+  white-space: pre-wrap;
+}
+
+.body {
+  display: grid;
+  grid-template-columns: minmax(380px, 1fr) 1.15fr;
+  gap: 12px;
+  min-height: 0;
+}
+
+.right {
+  display: grid;
+  grid-template-rows: 1fr 1.15fr;
+  gap: 12px;
+  min-height: 0;
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.panel h2 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.count { color: var(--muted); font-weight: 400; }
+
+.tools { display: flex; gap: 6px; flex-wrap: wrap; }
+
+.tools button {
+  padding: 4px 10px;
+  font-size: 13px;
+}
+
+.scroll { overflow: auto; flex: 1; min-height: 0; }
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+th, td {
+  text-align: left;
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+th { color: var(--muted); font-weight: 500; }
+
+tbody tr { cursor: pointer; }
+tbody tr:hover { background: var(--accent-soft); }
+tbody tr.selected { background: var(--accent-soft); box-shadow: inset 2px 0 0 var(--accent); }
+
+td.wrap { white-space: normal; word-break: break-all; }
+
+.state-Succeeded { color: var(--ok); }
+.state-Failed { color: var(--err); }
+.state-Running { color: var(--accent); }
+.state-Queued { color: var(--warn); }
+
+.hint { margin: 0 0 6px; color: var(--muted); font-size: 12px; }
+
+.logs pre {
+  margin: 0;
+  overflow: auto;
+  flex: 1;
+  min-height: 0;
+  font: 12px/1.45 Consolas, "Courier New", monospace;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+footer {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+button {
+  padding: 6px 14px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+}
+
+button:hover { border-color: var(--accent); }
+button.danger { color: var(--err); }
+button.danger:hover { border-color: var(--err); }
+button:disabled { opacity: 0.45; cursor: default; border-color: var(--border); }
+
+.spacer { flex: 1; }
+
+code { font: 12px Consolas, monospace; color: var(--muted); }
+
+/* 编辑对话框 */
+dialog {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel);
+  color: var(--text);
+  padding: 18px 20px;
+  width: 400px;
+}
+
+dialog::backdrop { background: rgba(0, 0, 0, 0.35); }
+
+dialog h2 { margin: 0 0 12px; font-size: 16px; }
+
+dialog label {
+  display: grid;
+  grid-template-columns: 74px 1fr;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+dialog input {
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+}
+
+dialog input:read-only { opacity: 0.7; }
+
+.dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.secondary { color: var(--muted); }

@@ -1,0 +1,20 @@
+# 构建产物
+/target/
+/gen/
+/dist/
+
+# 运行时数据（exe 旁的导出、上传暂存、缓存与日志）
+/export/
+/upload/
+/cache/
+/logs/
+
+# 编辑器与系统临时文件
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+*.old
+*.bak
+*.tmp

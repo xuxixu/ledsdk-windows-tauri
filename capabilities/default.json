@@ -1,0 +1,6 @@
+{
+  "identifier": "default",
+  "description": "主窗口默认能力（应用自定义命令不需要额外权限）",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

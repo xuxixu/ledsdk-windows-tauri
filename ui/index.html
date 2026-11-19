@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>LedSdk 屏幕节目上传服务</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <main id="app">
+      <header>
+        <h1>LedSdk 屏幕节目上传服务</h1>
+        <div id="status" class="status">正在读取状态…</div>
+      </header>
+
+      <section class="body">
+        <div class="panel screens">
+          <div class="panel-head">
+            <h2>屏幕清单 <span id="screen-count" class="count"></span></h2>
+            <div class="tools">
+              <button id="scan" title="取一次搜索快照并写回配置">扫描</button>
+              <button id="reload" title="从磁盘重新读取 appsettings.json">重新加载配置</button>
+              <button id="edit">编辑</button>
+              <button id="delete" class="danger">删除</button>
+            </div>
+          </div>
+          <p id="screen-hint" class="hint">选中一行后可编辑或删除；扫描不会覆盖人工填写的宽高/旋转。</p>
+          <div class="scroll">
+            <table>
+              <thead>
+                <tr><th>deviceId</th><th>名称</th><th>地址</th><th>几何</th><th>在线（上次扫描）</th></tr>
+              </thead>
+              <tbody id="screens"></tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="right">
+          <div class="panel">
+            <div class="panel-head">
+              <h2>最近作业 <span id="job-count" class="count"></span></h2>
+            </div>
+            <div class="scroll">
+              <table>
+                <thead>
+                  <tr><th>作业</th><th>设备</th><th>素材</th><th>状态</th><th>信息</th></tr>
+                </thead>
+                <tbody id="jobs"></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="panel logs">
+            <div class="panel-head">
+              <h2>运行日志</h2>
+            </div>
+            <pre id="logs">正在读取日志…</pre>
+          </div>
+        </div>
+      </section>
+
+      <footer>
+        <button id="open-config">打开配置目录</button>
+        <button id="open-export">打开导出目录</button>
+        <button id="open-logs">打开日志目录</button>
+        <span class="spacer"></span>
+        <button id="quit" class="danger">退出</button>
+      </footer>
+    </main>
+
+    <dialog id="edit-dialog">
+      <form method="dialog">
+        <h2>编辑屏幕</h2>
+        <label>deviceId<input id="f-device" readonly /></label>
+        <label>名称<input id="f-name" /></label>
+        <label>IP<input id="f-ip" /></label>
+        <label>端口<input id="f-port" type="number" min="1" max="65535" /></label>
+        <label>宽<input id="f-width" type="number" min="0" /></label>
+        <label>高<input id="f-height" type="number" min="0" /></label>
+        <label>旋转<input id="f-rotate" type="number" step="90" /></label>
+        <div class="dialog-actions">
+          <button value="cancel" class="secondary">取消</button>
+          <button id="save" value="save" class="primary">保存</button>
+        </div>
+      </form>
+    </dialog>
+
+    <script src="main.js"></script>
+  </body>
+</html>
