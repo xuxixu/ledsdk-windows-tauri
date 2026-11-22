@@ -1,6 +1,6 @@
 [package]
 name = "ledsdk-tauri"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 description = "LedSdk 屏幕节目上传服务（Rust + Tauri 重构版）"
 build = "build.rs"
