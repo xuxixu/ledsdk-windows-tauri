@@ -12,11 +12,12 @@ $exe = Join-Path $dist 'ledsdk-tauri.exe'
 $setup = Join-Path $dist 'setup.ps1'
 $config = Join-Path $dist 'config\appsettings.json'
 $source = Join-Path $PSScriptRoot 'installer\LedSdkSetup.cs'
+$uninstallerSource = Join-Path $PSScriptRoot 'installer\LedSdkUninstaller.cs'
 $icon = Join-Path $PSScriptRoot 'icons\icon.ico'
 $csc = 'C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 $out = Join-Path $dist ("LedSdk-Setup-{0}.exe" -f $Version)
 
-foreach ($path in @($exe, $setup, $config, $source, $icon, $csc)) {
+foreach ($path in @($exe, $setup, $config, $source, $uninstallerSource, $icon, $csc)) {
     if (-not (Test-Path $path)) { throw "缺少打包文件：$path" }
 }
 
@@ -24,6 +25,38 @@ $work = Join-Path $PSScriptRoot 'target\installer'
 New-Item -ItemType Directory -Force -Path $work | Out-Null
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $zip = Join-Path $work ("payload-{0}-{1}.zip" -f $stamp, $PID)
+
+# 0) 先编译卸载程序，随负载一起安装到目标目录。
+$framework = Split-Path -Parent $csc
+$references = @(
+    (Join-Path $framework 'System.dll'),
+    (Join-Path $framework 'System.Core.dll'),
+    (Join-Path $framework 'System.Drawing.dll'),
+    (Join-Path $framework 'System.Windows.Forms.dll'),
+    (Join-Path $framework 'System.IO.Compression.dll'),
+    (Join-Path $framework 'System.IO.Compression.FileSystem.dll')
+)
+foreach ($reference in $references) {
+    if (-not (Test-Path $reference)) { throw "缺少 .NET Framework 引用：$reference" }
+}
+
+$uninstallerExe = Join-Path $work 'uninstall.exe'
+$uninstallerArgs = @(
+    '/nologo',
+    '/codepage:65001',
+    '/target:winexe',
+    '/platform:anycpu',
+    '/optimize+',
+    ("/win32icon:{0}" -f $icon),
+    ("/out:{0}" -f $uninstallerExe)
+)
+foreach ($reference in $references) {
+    $uninstallerArgs += ("/reference:{0}" -f $reference)
+}
+$uninstallerArgs += $uninstallerSource
+& $csc $uninstallerArgs
+if ($LASTEXITCODE -ne 0) { throw "卸载程序编译失败（退出码 $LASTEXITCODE）" }
+Copy-Item $uninstallerExe (Join-Path $dist 'uninstall.exe') -Force
 
 # 1) 生成干净负载：排除运行残留、旧安装包与配置备份，避免把现场数据打进安装器。
 Add-Type -AssemblyName System.IO.Compression
@@ -57,15 +90,6 @@ $zipInfo = Get-Item $zip
 Write-Host ("安装负载：{0}（{1:N0} 字节）" -f $zipInfo.Name, $zipInfo.Length)
 
 # 2) 编译安装程序，把负载作为内嵌资源写入单文件 EXE。
-$framework = Split-Path -Parent $csc
-$references = @(
-    (Join-Path $framework 'System.dll'),
-    (Join-Path $framework 'System.Core.dll'),
-    (Join-Path $framework 'System.Drawing.dll'),
-    (Join-Path $framework 'System.Windows.Forms.dll'),
-    (Join-Path $framework 'System.IO.Compression.dll'),
-    (Join-Path $framework 'System.IO.Compression.FileSystem.dll')
-)
 $cscArgs = @(
     '/nologo',
     '/codepage:65001',

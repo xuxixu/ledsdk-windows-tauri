@@ -15,6 +15,11 @@ pub fn show_error_dialog(title: &str, message: &str) {
     error!("{title}：{message}");
 }
 
+/// 非 Windows 平台没有原生确认框；默认直接退出。
+pub fn confirm_yes_no(_title: &str, _message: &str) -> bool {
+    false
+}
+
 /// 非 Windows 平台没有 Windows 作业对象，也不需要靠它约束 SDK 子进程。
 pub fn assign_current_process() -> bool {
     false

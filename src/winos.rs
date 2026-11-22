@@ -19,8 +19,8 @@ use windows_sys::Win32::System::Registry::{
 };
 use windows_sys::Win32::System::Threading::{CreateMutexW, GetCurrentProcess, Sleep};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, IsIconic, MessageBoxW, SetForegroundWindow, ShowWindow, MB_ICONERROR,
-    MB_ICONINFORMATION, MB_OK, SW_RESTORE, SW_SHOW,
+    FindWindowW, IsIconic, MessageBoxW, SetForegroundWindow, ShowWindow, IDYES, MB_ICONERROR,
+    MB_ICONINFORMATION, MB_ICONQUESTION, MB_OK, MB_YESNO, SW_RESTORE, SW_SHOW,
 };
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
@@ -100,6 +100,21 @@ fn show_message(title: &str, message: &str, is_error: bool) {
             MB_OK | icon,
         );
     }
+}
+
+/// 询问是否退出到托盘模式：true 表示隐藏到托盘，false 表示直接退出。
+pub fn confirm_yes_no(title: &str, message: &str) -> bool {
+    let title = wide(title);
+    let message = wide(message);
+    let result = unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            message.as_ptr(),
+            title.as_ptr(),
+            MB_YESNO | MB_ICONQUESTION,
+        )
+    };
+    result == IDYES
 }
 
 /// 把当前进程放进「关闭即杀」的作业对象：崩溃 / 被强杀时 ffmpeg、TextRenderer 一并结束。
@@ -264,9 +279,24 @@ pub fn sync_desktop_shortcut(enabled: bool) -> bool {
     let shortcut = desktop.join(SHORTCUT_NAME);
     if !enabled {
         if shortcut.exists() {
-            match std::fs::remove_file(&shortcut) {
-                Ok(()) => info!("已按配置删除桌面快捷方式：{}", shortcut.display()),
-                Err(err) => warn!("删除桌面快捷方式失败 {}：{err}", shortcut.display()),
+            match read_shortcut_target(&shortcut) {
+                Ok(target) if !target.as_os_str().is_empty() && same_path(&target, &exe) => {
+                    match std::fs::remove_file(&shortcut) {
+                        Ok(()) => info!("已按配置删除桌面快捷方式：{}", shortcut.display()),
+                        Err(err) => warn!("删除桌面快捷方式失败 {}：{err}", shortcut.display()),
+                    }
+                }
+                Ok(target) if !target.as_os_str().is_empty() => {
+                    info!(
+                        "桌面快捷方式指向其他程序，保留：{} → {}",
+                        shortcut.display(),
+                        target.display()
+                    );
+                }
+                Ok(_) => warn!("桌面快捷方式目标为空，保留：{}", shortcut.display()),
+                Err(err) => {
+                    warn!("读取桌面快捷方式失败，保留 {}：{err}", shortcut.display());
+                }
             }
         }
         return !shortcut.exists();
@@ -281,6 +311,55 @@ pub fn sync_desktop_shortcut(enabled: bool) -> bool {
             false
         }
     }
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    let left = left.to_string_lossy();
+    let right = right.to_string_lossy();
+    left.eq_ignore_ascii_case(&right)
+}
+
+fn read_shortcut_target(path: &Path) -> windows::core::Result<std::path::PathBuf> {
+    use windows::core::{Interface, HSTRING};
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, IPersistFile, CLSCTX_INPROC_SERVER,
+        COINIT_APARTMENTTHREADED, STGM_READ,
+    };
+    use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+
+    struct ComGuard(bool);
+    impl Drop for ComGuard {
+        fn drop(&mut self) {
+            if self.0 {
+                unsafe { CoUninitialize() };
+            }
+        }
+    }
+
+    let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    let initialized = hr.is_ok();
+    if hr.is_err() && hr.0 != windows::Win32::Foundation::RPC_E_CHANGED_MODE.0 {
+        return Err(windows::core::Error::from(hr));
+    }
+    let _guard = ComGuard(initialized);
+
+    let link: IShellLinkW = unsafe { CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)? };
+    let persist: IPersistFile = link.cast()?;
+    let path_text = HSTRING::from(path.as_os_str());
+    unsafe { persist.Load(&path_text, STGM_READ)? };
+
+    let mut buffer = [0u16; 1024];
+    unsafe { link.GetPath(&mut buffer, std::ptr::null_mut(), 0)? };
+    let len = buffer
+        .iter()
+        .position(|&value| value == 0)
+        .unwrap_or(buffer.len());
+    if len == 0 {
+        return Ok(std::path::PathBuf::new());
+    }
+    Ok(std::path::PathBuf::from(String::from_utf16_lossy(
+        &buffer[..len],
+    )))
 }
 
 fn desktop_directory() -> Option<std::path::PathBuf> {

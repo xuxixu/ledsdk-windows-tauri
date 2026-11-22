@@ -275,13 +275,16 @@ curl.exe -X POST http://127.0.0.1:5180/api/program `
 
 ```powershell
 .\build-installer.ps1                          # 单独生成安装包
-.\dist\LedSdk-Setup-1.0.0.exe                  # 图形安装（可勾选桌面/开始菜单图标）
+.\dist\LedSdk-Setup-1.0.0.exe                  # 图形安装（可改安装路径、勾选桌面/开始菜单图标）
 .\dist\LedSdk-Setup-1.0.0.exe /silent          # 静默安装（默认创建两个图标）
 .\dist\LedSdk-Setup-1.0.0.exe /silent /nodesktop /nostartmenu
+.\dist\LedSdk-Setup-1.0.0.exe /silent /dir D:\Apps\LedSdk
 .\dist\LedSdk-Setup-1.0.0.exe /verify <目录>   # 只校验内嵌负载，不安装
 ```
 
-安装目标为 `%LOCALAPPDATA%\Programs\LedSdk`；安装后会写入 HKCU「应用和功能」卸载项，卸载时只删除指向本安装目录的快捷方式与自启项。托盘模式下关闭窗口只会隐藏，再次启动会自动唤起已有窗口，不会重复占用 SDK 端口。
+图形安装可在「安装位置」中直接输入或点击「浏览…」选择目录；升级时会优先填入注册表中记录的现有安装位置。默认安装目标为 `%LOCALAPPDATA%\Programs\LedSdk`，静默安装可用 `/dir <绝对路径>` 指定目录。安装器会拒绝磁盘根目录、Windows 系统目录、被文件占用的路径和不可写目录。安装后会写入 HKCU「应用和功能」卸载项，卸载时只删除指向本安装目录的快捷方式与自启项。托盘模式下关闭窗口或点「退出」都会先询问是否退出到托盘模式；选「是」隐藏到托盘，选「否」关闭软件。再次启动会自动唤起已有窗口，不会重复占用 SDK 端口。
+
+卸载使用安装目录下的 `uninstall.exe`（或 Windows「应用和功能」中的 LedSdk）。卸载窗口会完整显示自定义安装路径；卸载前会检查该目录下的程序是否正在运行，如正在运行可选择强制停止；可勾选删除桌面/开始菜单快捷方式、开机自启动，以及是否保留用户数据（配置/导出/日志/缓存/上传）。安装和卸载界面均使用自适应布局，长标题、长路径和状态文字不会被截断或相互遮挡。
 
 ### 便携/脚本安装（可选）
 
@@ -292,11 +295,12 @@ curl.exe -X POST http://127.0.0.1:5180/api/program `
 .\setup.ps1 -NoDesktopShortcut       # 不创建桌面图标
 .\setup.ps1 -NoStartMenuShortcut     # 不创建开始菜单图标
 .\setup.ps1 -Quiet                   # 静默安装，默认两个图标都创建
-.\setup.ps1 -Uninstall               # 卸载（保留安装目录外的用户数据）
-.\setup.ps1 -TargetDir D:\Apps\LedSdk  # 安装到指定目录
+.\setup.ps1 -Uninstall               # 卸载（先检查并确认是否强制停止运行中的实例）
+.\setup.ps1 -TargetDir D:\Apps\LedSdk  # 安装到指定绝对目录
+.\setup.ps1 -Uninstall -TargetDir D:\Apps\LedSdk -PurgeData  # 卸载并删除用户数据
 ```
 
-安装目标为 `%LOCALAPPDATA%\Programs\LedSdk`，脚本会同步写入 `App.TrayIcon=true` 和 `App.DesktopShortcut`，并按 `App.AutoStart` 维护 HKCU Run 项。
+不指定 `-TargetDir` 时安装目标为 `%LOCALAPPDATA%\Programs\LedSdk`。脚本会同步写入 `App.TrayIcon=true` 和 `App.DesktopShortcut`，并按 `App.AutoStart` 维护 HKCU Run 项；运行中进程检查只匹配当前目标目录下的 `ledsdk-tauri.exe`。
 
 ## 验证状态
 
@@ -308,8 +312,10 @@ curl.exe -X POST http://127.0.0.1:5180/api/program `
 | 上传上限 | 3 MB / 4.1 MB 上传均正常（旧实现被 axum 默认 2 MB 挡掉） |
 | 接口鉴权 | `UploadApi.Token` 非空时缺 `Authorization` 返回 401 |
 | 桌面窗口 | 标题栏正常、状态/屏幕/作业/日志四块渲染正常（CSP 开启后复核） |
-| 退出 | 点关闭 0.2 秒退出，无残留进程，18080/5180 释放 |
+| 关闭 | 确认后 0.2 秒退出，无残留进程，18080/5180 释放 |
+| 退出按钮/右上角关闭 | 均弹出「是否退出到托盘模式」；是→隐藏，否→退出并释放端口 |
 | 单实例 | 关闭到托盘后再次启动，新进程约 0.2 秒退出并唤起已有窗口 |
 | 启动失败 / CLI 早退 | 干净返回退出码（不再出现 0xC0000409 外来异常中止） |
 | 单文件安装包 | `dist\LedSdk-Setup-1.0.0.exe` 图形/静默安装、卸载、内嵌负载校验通过 |
+| 卸载程序 | 运行检测/强制停止、快捷方式/自启/用户数据勾选、卸载项清理通过 |
 | 真机投屏 | 未在本次环境验证（需设备同网段） |

@@ -156,6 +156,21 @@ fn open_folder(runtime: State<'_, SharedRuntime>, path: String) -> bool {
 
 #[tauri::command]
 fn quit_app(app: tauri::AppHandle) {
+    if let Some(runtime) = app.try_state::<SharedRuntime>() {
+        if runtime.registry.settings().app.tray_icon && app.tray_by_id("main").is_some() {
+            let to_tray = winos::confirm_yes_no(
+                "LedSdk",
+                "是否退出到托盘模式？\n\n是：隐藏到系统托盘；否：关闭软件。",
+            );
+            if to_tray {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.hide();
+                }
+                info!("用户选择退出到托盘模式，窗口已隐藏。");
+                return;
+            }
+        }
+    }
     request_exit(&app);
 }
 
@@ -337,11 +352,21 @@ fn main() {
                     if let Some(runtime) = app.try_state::<SharedRuntime>() {
                         if runtime.registry.settings().app.tray_icon {
                             if app.tray_by_id("main").is_some() {
-                                api.prevent_close();
-                                if let Some(window) = app.get_webview_window("main") {
-                                    let _ = window.hide();
+                                let to_tray = winos::confirm_yes_no(
+                                    "LedSdk",
+                                    "是否退出到托盘模式？\n\n是：隐藏到系统托盘；否：关闭软件。",
+                                );
+                                if to_tray {
+                                    api.prevent_close();
+                                    if let Some(window) = app.get_webview_window("main") {
+                                        let _ = window.hide();
+                                    }
+                                    info!("窗口已隐藏到系统托盘；右键托盘图标可重新打开或退出。");
+                                } else {
+                                    api.prevent_close();
+                                    info!("用户选择关闭软件。");
+                                    request_exit(app);
                                 }
-                                info!("窗口已隐藏到系统托盘；右键托盘图标可重新打开或退出。");
                             } else {
                                 error!("配置要求托盘模式，但托盘图标不存在；本次关闭将直接退出。");
                             }
