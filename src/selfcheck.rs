@@ -200,6 +200,10 @@ fn check_registry_edits() -> i32 {
         crate::config::load_or_default(&recover).screens.len() == 1,
         true,
     );
+
+    let defaults = crate::config::AppSettings::default();
+    failures += expect_bool("托盘图标默认开启", defaults.app.tray_icon, true);
+    failures += expect_bool("桌面快捷方式默认开启", defaults.app.desktop_shortcut, true);
     failures
 }
 
@@ -472,6 +476,8 @@ fn check_lifecycle() -> i32 {
     settings.sdk.upload_root = run_dir.join("upload").to_string_lossy().to_string();
     settings.sdk.transcode_cache_root = run_dir.join("cache").to_string_lossy().to_string();
     settings.sdk.bin_directory = default_bin_directory();
+    settings.app.tray_icon = false;
+    settings.app.desktop_shortcut = false;
 
     let config_path = run_dir.join("appsettings.json");
     if let Err(err) = crate::config::save(&config_path, &settings) {

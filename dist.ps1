@@ -1,4 +1,4 @@
-# 一键构建发行版：cargo build --release，然后把 exe / 配置 / SDK 运行文件 / 说明拷到 dist\。
+﻿# 一键构建发行版：cargo build --release，然后把 exe / 配置 / SDK 运行文件 / 说明拷到 dist\。
 # 发版只跑这个脚本，避免 dist 里的二进制比 target\release 旧。
 # 注意：不清理 dist 里的旧文件（删除需人工确认）；若上游文件改名，请手动清理残留。
 $ErrorActionPreference = 'Stop'
@@ -27,6 +27,8 @@ if (-not (Test-Path $configTarget)) {
 }
 Copy-Item (Join-Path $PSScriptRoot 'README.md') $dist -Force
 Copy-Item (Join-Path $PSScriptRoot 'THIRD-PARTY-NOTICES.md') $dist -Force
+# 安装脚本以自身目录作为安装源，必须和 exe/config 一起放在发行根目录。
+Copy-Item (Join-Path $PSScriptRoot 'installer\setup.ps1') $dist -Force
 # LedSDK.lib 只在编译期用，不进发行版。
 # /XD logs 排除测试遗留的日志目录，避免发行版夹带内部测试路径。
 robocopy $sdk $dist /E /XF LedSDK.lib /XD logs /NFL /NDL /NJH /NJS | Out-Null
@@ -36,3 +38,9 @@ if ($LASTEXITCODE -ge 8) { throw "robocopy 复制 SDK 失败（退出码 $LASTEX
 $total = (Get-ChildItem $dist -Recurse -File | Measure-Object Length -Sum).Sum
 $stamp = (Get-Item $exe).LastWriteTime
 Write-Host ("发行版已更新：{0}（共 {1:N0} 字节；exe 构建于 {2}）" -f $dist, $total, $stamp)
+
+# 生成单文件安装包；安装程序是可选的交付方式，失败时不影响已生成的 dist。
+$installerScript = Join-Path $PSScriptRoot 'build-installer.ps1'
+if (Test-Path $installerScript) {
+    & $installerScript
+}

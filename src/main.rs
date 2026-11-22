@@ -22,12 +22,18 @@ mod winos;
 mod winos;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use log::{error, info, warn};
+use tauri::menu::MenuBuilder;
+use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
 use tauri::{Manager, RunEvent, State};
 
 type SharedRuntime = Arc<runtime::Runtime>;
+
+/// 退出流程只允许执行一次：托盘菜单、界面按钮和系统关闭可能同时触发。
+static EXITING: AtomicBool = AtomicBool::new(false);
 
 #[tauri::command]
 fn get_status(runtime: State<'_, SharedRuntime>) -> serde_json::Value {
@@ -150,16 +156,88 @@ fn open_folder(runtime: State<'_, SharedRuntime>, path: String) -> bool {
 
 #[tauri::command]
 fn quit_app(app: tauri::AppHandle) {
-    // exit(0) 会触发 RunEvent::Exit，复用同一条关闭链（停 HTTP → 停 SDK → 关日志）。
-    app.exit(0);
+    request_exit(&app);
+}
+
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
+    let menu = MenuBuilder::new(app)
+        .text("show", "打开界面")
+        .separator()
+        .text("quit", "退出")
+        .build()?;
+    let mut builder = TrayIconBuilder::with_id("main")
+        .tooltip("LedSdk 屏幕节目上传服务")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "show" => show_main_window(app),
+            "quit" => request_exit(app),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: tauri::tray::MouseButtonState::Up,
+                ..
+            } = event
+            {
+                show_main_window(tray.app_handle());
+            }
+        });
+    if let Some(icon) = app.default_window_icon() {
+        builder = builder.icon(icon.clone());
+    }
+    builder.build(app)?;
+    info!("系统托盘图标已启用。");
+    Ok(())
+}
+
+/// 主动退出：先在后台完成 SDK/HTTP 清理，再直接结束进程。
+///
+/// 不走 `app.exit()` 是为了跳过 Tauri 事件循环销毁托盘与原生菜单的路径：
+/// 在托盘菜单回调仍在栈上时销毁菜单，Windows 会在 ntdll 中以 0xC000000D
+/// 终止进程。`TerminateProcess` 不跑 DllMain(DETACH)，也不会触发这条路径。
+fn request_exit(app: &tauri::AppHandle) {
+    if EXITING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let runtime = app
+        .try_state::<SharedRuntime>()
+        .map(|state| state.inner().clone());
+    std::thread::spawn(move || {
+        if let Some(runtime) = runtime {
+            info!("开始关闭：停上传接口 → 停 SDK（搜索/任务/HTTP）→ 关日志。");
+            if !runtime.stop() {
+                warn!("关闭未完全完成，仍将结束进程。");
+            }
+        }
+        exit_now(0);
+    });
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let cli_mode = args
+        .iter()
+        .any(|arg| arg == "--selfcheck" || arg == "--simulate");
+
+    // 单实例保护：托盘模式下重复点桌面图标时唤起已有窗口，避免 SDK/HTTP 端口冲突后静默退出。
+    if !cli_mode && !winos::ensure_single_instance() {
+        exit_now(0);
+    }
+
     // 作业对象要在任何子进程出现之前建立：之后 ffmpeg / TextRenderer 才会随主进程一起结束。
     // 无论带什么参数都先建立（CLI 模式同样可能拉起子进程，曾经因为 `--` 前缀跳过这里）。
     winos::assign_current_process();
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|arg| arg == "--selfcheck") {
         exit_now(selfcheck::run());
     }
@@ -189,12 +267,18 @@ fn main() {
                     // 启动失败时 SDK 可能已加载但没有 initialize，正常退出会在 C++ 析构里抛异常
                     // （0xC0000409）；这里直接终止进程，留下日志与本条 stderr。
                     eprintln!("启动失败：{err}");
+                    winos::show_error_dialog("LedSdk 启动失败", &format!("启动失败：{err}"));
                     exit_now(1);
                 }
             };
             app.manage(runtime.clone());
 
             let settings = runtime.registry.settings();
+            if settings.app.tray_icon {
+                if let Err(err) = setup_tray(app) {
+                    error!("创建系统托盘失败：{err}");
+                }
+            }
             let state = server::ApiState {
                 host: runtime.host.clone(),
                 registry: runtime.registry.clone(),
@@ -243,7 +327,34 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("构建 Tauri 应用失败")
         .run(|app, event| {
+            if let RunEvent::WindowEvent {
+                label,
+                event: tauri::WindowEvent::CloseRequested { api, .. },
+                ..
+            } = &event
+            {
+                if label == "main" {
+                    if let Some(runtime) = app.try_state::<SharedRuntime>() {
+                        if runtime.registry.settings().app.tray_icon {
+                            if app.tray_by_id("main").is_some() {
+                                api.prevent_close();
+                                if let Some(window) = app.get_webview_window("main") {
+                                    let _ = window.hide();
+                                }
+                                info!("窗口已隐藏到系统托盘；右键托盘图标可重新打开或退出。");
+                            } else {
+                                error!("配置要求托盘模式，但托盘图标不存在；本次关闭将直接退出。");
+                            }
+                        }
+                    }
+                }
+            }
             if let RunEvent::Exit = event {
+                if EXITING.swap(true, Ordering::SeqCst) {
+                    // 主动退出路径已经接手清理；这里直接结束，避免 Tauri
+                    // 再销毁托盘/菜单原生对象。
+                    exit_now(0);
+                }
                 if let Some(runtime) = app.try_state::<SharedRuntime>() {
                     info!("开始关闭：停上传接口 → 停 SDK（搜索/任务/HTTP）→ 关日志。");
                     // 兜底：SDK 原生调用万一不返回，8 秒后强制退出（子进程由作业对象连带结束）。
@@ -257,6 +368,7 @@ fn main() {
                     } else {
                         warn!("关闭未完全完成，等待 watchdog 强制退出。");
                     }
+                    exit_now(0);
                 }
             }
         });

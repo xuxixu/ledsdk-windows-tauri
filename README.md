@@ -10,6 +10,9 @@ LED 控制卡节目上传服务，用 **Rust + Tauri 2** 重构自同目录的 C
 
 Tauri 窗口是管理/监控面板：状态、屏幕清单（扫描/编辑/删除）、最近作业、运行日志，以及打开配置/导出/日志目录（只允许打开这四类目录，其它路径会被拒绝）。
 
+- 托盘图标（`App.TrayIcon=true`，默认开启）：右键菜单「打开界面 / 退出」，左键单击/双击也可重新显示窗口；关闭窗口时隐藏到托盘，程序继续提供上传接口与设备发现。设为 `false` 时不创建托盘，关闭窗口即退出。
+- 桌面图标（`App.DesktopShortcut=true`，默认开启）：每次启动同步用户桌面 `LedSdk.lnk`，指向当前 exe；设为 `false` 时删除该快捷方式。安装程序还可单独选择是否创建桌面/开始菜单图标。
+
 ## 目录结构
 
 ```
@@ -80,6 +83,8 @@ LedSdk_windows_Tauri/
 | `UploadApi.ListenAddress` / `Port` | `0.0.0.0` / `5180` | 上传接口监听 |
 | `UploadApi.Token` | `""` | 非空时，上传与几何接口要求 `Authorization: Bearer <token>`；留空不校验（仅限受控网络） |
 | `App.AutoStart` | `false` | 开机自启（写 HKCU `Run`，值名 `LedSdkTauri`）：`true` 写入/校正，`false` 删除；每次启动时同步，改配置后需重启生效 |
+| `App.TrayIcon` | `true` | 显示系统托盘图标；关闭窗口时隐藏到托盘。`false` 时关闭窗口直接退出 |
+| `App.DesktopShortcut` | `true` | 在用户桌面创建/校正 `LedSdk.lnk`；`false` 时删除该快捷方式 |
 | `App.RetentionDays` | `30` | 启动时清理超过该天数的日志、导出产物与 `upload/` 里的残留文件（`<=0` 不清理） |
 | `Screens[]` | `[]` | 屏幕清单，字段见下；搜索发现会按 `DeviceId` upsert 并写回 |
 
@@ -259,10 +264,39 @@ curl.exe -X POST http://127.0.0.1:5180/api/program `
 ## 发版
 
 ```powershell
-.\dist.ps1     # cargo build --release + 把 exe / config / sdk\x64 / README 拷到 dist\
+.\dist.ps1     # cargo build --release + 组装 dist\，并生成 dist\LedSdk-Setup-<version>.exe
 ```
 
 `dist.ps1` 不清理 `dist\` 里的旧文件（删除需人工确认）；已有的 `dist\config\appsettings.json` 不会被覆盖，模板另存为 `appsettings.template.json`。上游文件改名后请手动删残留。
+
+### 单文件安装包（推荐）
+
+`build-installer.ps1` 使用 Windows 自带的 .NET Framework 4.8 `csc.exe`，把 `dist\` 的运行文件压成内嵌负载，生成单文件 `LedSdk-Setup-<version>.exe`，不引入第三方安装器依赖：
+
+```powershell
+.\build-installer.ps1                          # 单独生成安装包
+.\dist\LedSdk-Setup-1.0.0.exe                  # 图形安装（可勾选桌面/开始菜单图标）
+.\dist\LedSdk-Setup-1.0.0.exe /silent          # 静默安装（默认创建两个图标）
+.\dist\LedSdk-Setup-1.0.0.exe /silent /nodesktop /nostartmenu
+.\dist\LedSdk-Setup-1.0.0.exe /verify <目录>   # 只校验内嵌负载，不安装
+```
+
+安装目标为 `%LOCALAPPDATA%\Programs\LedSdk`；安装后会写入 HKCU「应用和功能」卸载项，卸载时只删除指向本安装目录的快捷方式与自启项。托盘模式下关闭窗口只会隐藏，再次启动会自动唤起已有窗口，不会重复占用 SDK 端口。
+
+### 便携/脚本安装（可选）
+
+`installer\setup.ps1` 仍可单独使用，适合复制 `dist\` 到目标机后运行：
+
+```powershell
+.\setup.ps1                          # 交互式，询问是否创建桌面/开始菜单图标
+.\setup.ps1 -NoDesktopShortcut       # 不创建桌面图标
+.\setup.ps1 -NoStartMenuShortcut     # 不创建开始菜单图标
+.\setup.ps1 -Quiet                   # 静默安装，默认两个图标都创建
+.\setup.ps1 -Uninstall               # 卸载（保留安装目录外的用户数据）
+.\setup.ps1 -TargetDir D:\Apps\LedSdk  # 安装到指定目录
+```
+
+安装目标为 `%LOCALAPPDATA%\Programs\LedSdk`，脚本会同步写入 `App.TrayIcon=true` 和 `App.DesktopShortcut`，并按 `App.AutoStart` 维护 HKCU Run 项。
 
 ## 验证状态
 
@@ -275,5 +309,7 @@ curl.exe -X POST http://127.0.0.1:5180/api/program `
 | 接口鉴权 | `UploadApi.Token` 非空时缺 `Authorization` 返回 401 |
 | 桌面窗口 | 标题栏正常、状态/屏幕/作业/日志四块渲染正常（CSP 开启后复核） |
 | 退出 | 点关闭 0.2 秒退出，无残留进程，18080/5180 释放 |
+| 单实例 | 关闭到托盘后再次启动，新进程约 0.2 秒退出并唤起已有窗口 |
 | 启动失败 / CLI 早退 | 干净返回退出码（不再出现 0xC0000409 外来异常中止） |
+| 单文件安装包 | `dist\LedSdk-Setup-1.0.0.exe` 图形/静默安装、卸载、内嵌负载校验通过 |
 | 真机投屏 | 未在本次环境验证（需设备同网段） |

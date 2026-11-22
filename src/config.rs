@@ -82,6 +82,10 @@ impl Default for UploadApiSettings {
 #[serde(rename_all = "PascalCase", default)]
 pub struct AppHostSettings {
     pub auto_start: bool,
+    /// 显示系统托盘图标；关闭后窗口关闭即退出。
+    pub tray_icon: bool,
+    /// 在用户桌面创建/维护快捷方式；无快捷方式时按此开关补建。
+    pub desktop_shortcut: bool,
     pub retention_days: i32,
 }
 
@@ -89,6 +93,8 @@ impl Default for AppHostSettings {
     fn default() -> Self {
         Self {
             auto_start: false,
+            tray_icon: true,
+            desktop_shortcut: true,
             retention_days: 30,
         }
     }

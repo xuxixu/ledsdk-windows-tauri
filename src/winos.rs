@@ -1,10 +1,13 @@
 //! Windows 专用能力：开机自启（HKCU Run）与「子进程随主进程退出」（作业对象）。
 
 use std::ffi::c_void;
+use std::path::Path;
 use std::sync::OnceLock;
 
 use log::{error, info, warn};
-use windows_sys::Win32::Foundation::{CloseHandle, ERROR_SUCCESS};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, ERROR_SUCCESS,
+};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
     SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -14,13 +17,89 @@ use windows_sys::Win32::System::Registry::{
     RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegQueryValueExW, RegSetValueExW, HKEY,
     HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ,
 };
-use windows_sys::Win32::System::Threading::GetCurrentProcess;
+use windows_sys::Win32::System::Threading::{CreateMutexW, GetCurrentProcess, Sleep};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    FindWindowW, IsIconic, MessageBoxW, SetForegroundWindow, ShowWindow, MB_ICONERROR,
+    MB_ICONINFORMATION, MB_OK, SW_RESTORE, SW_SHOW,
+};
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const VALUE_NAME: &str = "LedSdkTauri";
+const SHORTCUT_NAME: &str = "LedSdk.lnk";
+const SINGLE_INSTANCE_MUTEX: &str = "LedSdkTauriSingleInstance";
+const MAIN_WINDOW_TITLE: &str = "LedSdk 屏幕节目上传服务";
 
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// 单实例保护：已有实例时尝试恢复并前置它的主窗口，返回 false 让新进程退出。
+///
+/// 托盘模式下关闭窗口只是隐藏；用户再次点桌面图标时，如果直接启动第二个进程，
+/// SDK 的 HTTP 服务会因端口被首个进程占用而启动失败，表现为窗口一闪就消失。
+pub fn ensure_single_instance() -> bool {
+    let name = wide(SINGLE_INSTANCE_MUTEX);
+    let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+    if handle.is_null() {
+        warn!(
+            "创建单实例互斥体失败，继续启动：{}",
+            std::io::Error::last_os_error()
+        );
+        return true;
+    }
+    if unsafe { GetLastError() } != ERROR_ALREADY_EXISTS {
+        // 句柄故意不关闭：进程退出时由系统释放，互斥体随之消失。
+        return true;
+    }
+    unsafe { CloseHandle(handle) };
+
+    // 首个实例可能刚启动、窗口尚未创建，短暂重试后再提示。
+    let title = wide(MAIN_WINDOW_TITLE);
+    for _ in 0..10 {
+        let hwnd = unsafe { FindWindowW(std::ptr::null(), title.as_ptr()) };
+        if !hwnd.is_null() {
+            unsafe {
+                if IsIconic(hwnd) != 0 {
+                    ShowWindow(hwnd, SW_RESTORE);
+                } else {
+                    ShowWindow(hwnd, SW_SHOW);
+                }
+                SetForegroundWindow(hwnd);
+            }
+            return false;
+        }
+        unsafe { Sleep(100) };
+    }
+
+    show_message(
+        "LedSdk 已在运行",
+        "LedSdk 已在运行，请从系统托盘图标打开界面。",
+        false,
+    );
+    false
+}
+
+/// 显示启动失败等错误提示：GUI 版没有控制台，必须让用户看到失败原因。
+pub fn show_error_dialog(title: &str, message: &str) {
+    show_message(title, message, true);
+}
+
+fn show_message(title: &str, message: &str, is_error: bool) {
+    let title = wide(title);
+    let message = wide(message);
+    let icon = if is_error {
+        MB_ICONERROR
+    } else {
+        MB_ICONINFORMATION
+    };
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            message.as_ptr(),
+            title.as_ptr(),
+            MB_OK | icon,
+        );
+    }
 }
 
 /// 把当前进程放进「关闭即杀」的作业对象：崩溃 / 被强杀时 ffmpeg、TextRenderer 一并结束。
@@ -167,4 +246,90 @@ fn read_value(key: HKEY, name: &[u16]) -> Option<String> {
         .take_while(|value| *value != 0)
         .collect();
     Some(String::from_utf16_lossy(&raw))
+}
+
+/// 在用户桌面创建/更新快捷方式。返回 true 表示快捷方式存在且指向当前 exe。
+pub fn sync_desktop_shortcut(enabled: bool) -> bool {
+    let exe = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(err) => {
+            warn!("读取当前可执行文件路径失败，跳过桌面快捷方式：{err}");
+            return false;
+        }
+    };
+    let Some(desktop) = desktop_directory() else {
+        warn!("无法定位桌面目录，跳过桌面快捷方式。");
+        return false;
+    };
+    let shortcut = desktop.join(SHORTCUT_NAME);
+    if !enabled {
+        if shortcut.exists() {
+            match std::fs::remove_file(&shortcut) {
+                Ok(()) => info!("已按配置删除桌面快捷方式：{}", shortcut.display()),
+                Err(err) => warn!("删除桌面快捷方式失败 {}：{err}", shortcut.display()),
+            }
+        }
+        return !shortcut.exists();
+    }
+    match write_shortcut(&shortcut, &exe) {
+        Ok(()) => {
+            info!("桌面快捷方式已就绪：{}", shortcut.display());
+            true
+        }
+        Err(err) => {
+            warn!("创建桌面快捷方式失败 {}：{err}", shortcut.display());
+            false
+        }
+    }
+}
+
+fn desktop_directory() -> Option<std::path::PathBuf> {
+    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::UI::Shell::{FOLDERID_Desktop, SHGetKnownFolderPath, KF_FLAG_DEFAULT};
+    let path = unsafe { SHGetKnownFolderPath(&FOLDERID_Desktop, KF_FLAG_DEFAULT, None) }.ok()?;
+    let text = unsafe { path.to_string().ok() };
+    unsafe { CoTaskMemFree(Some(path.as_ptr() as *const c_void)) };
+    text.map(std::path::PathBuf::from)
+}
+
+fn write_shortcut(path: &Path, exe: &Path) -> windows::core::Result<()> {
+    use windows::core::{Interface, HSTRING};
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
+        COINIT_APARTMENTTHREADED,
+    };
+    use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+
+    struct ComGuard(bool);
+    impl Drop for ComGuard {
+        fn drop(&mut self) {
+            if self.0 {
+                unsafe { CoUninitialize() };
+            }
+        }
+    }
+
+    let hr = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+    // RPC_E_CHANGED_MODE：当前线程已用其他模型初始化 COM，仍可继续使用。
+    let initialized = hr.is_ok();
+    if hr.is_err() && hr.0 != windows::Win32::Foundation::RPC_E_CHANGED_MODE.0 {
+        return Err(windows::core::Error::from(hr));
+    }
+    let _guard = ComGuard(initialized);
+
+    let link: IShellLinkW = unsafe { CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)? };
+    let exe_text = HSTRING::from(exe.as_os_str());
+    let workdir = exe.parent().unwrap_or_else(|| Path::new("."));
+    let workdir_text = HSTRING::from(workdir.as_os_str());
+    let description = HSTRING::from("LedSdk 屏幕节目上传服务");
+    unsafe {
+        link.SetPath(&exe_text)?;
+        link.SetWorkingDirectory(&workdir_text)?;
+        link.SetDescription(&description)?;
+        link.SetIconLocation(&exe_text, 0)?;
+        let persist: windows::Win32::System::Com::IPersistFile = link.cast()?;
+        let path_text = HSTRING::from(path.as_os_str());
+        persist.Save(&path_text, true)?;
+    }
+    Ok(())
 }

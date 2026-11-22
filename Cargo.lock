@@ -1851,6 +1851,7 @@ dependencies = [
  "url",
  "utoipa",
  "utoipa-swagger-ui",
+ "windows",
  "windows-sys 0.61.2",
 ]
 

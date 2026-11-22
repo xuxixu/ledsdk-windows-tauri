@@ -314,6 +314,8 @@ fn simulate_settings(bin_directory: &str, run_dir: &Path) -> AppSettings {
         },
         app: AppHostSettings {
             auto_start: false,
+            tray_icon: false,
+            desktop_shortcut: false,
             retention_days: 0,
         },
         screens: vec![

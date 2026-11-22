@@ -102,8 +102,9 @@ impl Runtime {
         }
         if write_registry {
             crate::winos::sync_autostart(app_settings.auto_start);
+            crate::winos::sync_desktop_shortcut(app_settings.desktop_shortcut);
         } else {
-            debug!("诊断模式：跳过开机自启同步（不改动注册表）。");
+            debug!("诊断模式：跳过开机自启/桌面快捷方式同步。");
         }
 
         let host = Arc::new(SdkHost::new());
