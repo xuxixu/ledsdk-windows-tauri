@@ -278,11 +278,11 @@ curl.exe -X POST http://127.0.0.1:5180/api/program `
 
 ```powershell
 .\build-installer.ps1                          # 单独生成安装包
-.\dist\LedSdk-Setup-1.0.2.exe                  # 图形安装（可改安装路径、勾选桌面/开始菜单图标）
-.\dist\LedSdk-Setup-1.0.2.exe /silent          # 静默安装（默认创建两个图标）
-.\dist\LedSdk-Setup-1.0.2.exe /silent /nodesktop /nostartmenu
-.\dist\LedSdk-Setup-1.0.2.exe /silent /dir D:\Apps\LedSdk
-.\dist\LedSdk-Setup-1.0.2.exe /verify <目录>   # 只校验内嵌负载，不安装
+.\dist\LedSdk-Setup-1.0.4.exe                  # 图形安装（可改安装路径、勾选桌面/开始菜单图标）
+.\dist\LedSdk-Setup-1.0.4.exe /silent          # 静默安装（默认创建两个图标）
+.\dist\LedSdk-Setup-1.0.4.exe /silent /nodesktop /nostartmenu
+.\dist\LedSdk-Setup-1.0.4.exe /silent /dir D:\Apps\LedSdk
+.\dist\LedSdk-Setup-1.0.4.exe /verify <目录>   # 只校验内嵌负载，不安装
 ```
 
 图形安装可在「安装位置」中直接输入或点击「浏览…」选择目录；升级时会优先填入注册表中记录的现有安装位置。默认安装目标为 `%LOCALAPPDATA%\Programs\LedSdk`，静默安装可用 `/dir <绝对路径>` 指定目录。安装器会拒绝磁盘根目录、Windows 系统目录、被文件占用的路径和不可写目录。安装后会写入 HKCU「应用和功能」卸载项，卸载时只删除指向本安装目录的快捷方式与自启项。托盘模式下关闭窗口或点「退出」都会先询问是否退出到托盘模式；选「是」隐藏到托盘，选「否」关闭软件。再次启动会自动唤起已有窗口，不会重复占用 SDK 端口。
@@ -319,6 +319,6 @@ curl.exe -X POST http://127.0.0.1:5180/api/program `
 | 退出按钮/右上角关闭 | 均弹出「是否退出到托盘模式」；是→隐藏，否→退出并释放端口 |
 | 单实例 | 关闭到托盘后再次启动，新进程约 0.2 秒退出并唤起已有窗口 |
 | 启动失败 / CLI 早退 | 干净返回退出码（不再出现 0xC0000409 外来异常中止） |
-| 单文件安装包 | `dist\LedSdk-Setup-1.0.2.exe` 图形/静默安装、卸载、内嵌负载校验通过 |
+| 单文件安装包 | `dist\LedSdk-Setup-1.0.4.exe` 图形/静默安装、卸载、内嵌负载校验通过 |
 | 卸载程序 | 运行检测/强制停止、快捷方式/自启/用户数据勾选、卸载项清理通过 |
 | 真机投屏 | 未在本次环境验证（需设备同网段） |

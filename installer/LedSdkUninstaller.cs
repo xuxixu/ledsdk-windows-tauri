@@ -16,8 +16,8 @@ using Microsoft.Win32;
 [assembly: AssemblyDescription("LedSdk 屏幕节目上传服务卸载程序")]
 [assembly: AssemblyProduct("LedSdk")]
 [assembly: AssemblyCompany("LedSdk")]
-[assembly: AssemblyVersion("1.0.2.0")]
-[assembly: AssemblyFileVersion("1.0.2.0")]
+[assembly: AssemblyVersion("1.0.4.0")]
+[assembly: AssemblyFileVersion("1.0.4.0")]
 
 namespace LedSdkUninstaller
 {
@@ -31,7 +31,7 @@ namespace LedSdkUninstaller
 
     internal static class Program
     {
-        internal const string Version = "1.0.2";
+        internal const string Version = "1.0.4";
         private const int MoveFileDelayUntilReboot = 0x4;
 
         [DllImport("user32.dll")]

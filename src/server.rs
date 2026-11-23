@@ -62,7 +62,7 @@ const MAX_REQUEST_FIELD_BYTES: usize = 64 * 1024;
 #[openapi(
     info(
         title = "LedSdk 屏幕节目上传接口",
-        version = "1.0.2",
+        version = "1.0.4",
         description = "上传 JSON + 素材文件 → 建节目树 → 校验 → 导出 → 发送到屏幕。所有响应为 UTF-8 JSON。"
     ),
     paths(health, list_screens, list_jobs, get_job, set_geometry, upload_program),
