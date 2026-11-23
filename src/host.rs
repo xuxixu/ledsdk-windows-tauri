@@ -259,8 +259,10 @@ impl SdkHost {
             o.upload_root_utf8 = upload_root.as_ptr();
             o.max_upload_size = 1024 * 1024 * 1024;
             o.request_timeout_ms = 30_000;
-            // 绝对路径 flag 会让未认证的 18080 变成任意文件读取服务，必须保持关闭。
-            o.flags = ffi::http_flag::ALLOW_RANGE;
+            // SDK 的 ledsdk_send_program 强制要求绝对路径下载 flag，关闭会在发送阶段报
+            // "HTTP service must enable absolute path downloads"。该 flag 让 18080 可按
+            // /d:/... 读取文件，因此必须通过防火墙把入站来源限制为设备网段。
+            o.flags = ffi::http_flag::ALLOW_RANGE | ffi::http_flag::ALLOW_ABSOLUTE_PATH;
         });
         let mut http: Handle = ffi::NULL_HANDLE;
         let rc = unsafe { ffi::ledsdk_http_create(context, &http_options, &mut http) };

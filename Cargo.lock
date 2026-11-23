@@ -1835,7 +1835,7 @@ dependencies = [
 
 [[package]]
 name = "ledsdk-tauri"
-version = "1.0.1"
+version = "1.0.2"
 dependencies = [
  "axum",
  "if-addrs",

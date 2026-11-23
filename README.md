@@ -74,8 +74,10 @@ LedSdk_windows_Tauri/
 | `Sdk.TranscodeCacheRoot` | `../cache` | 视频/GIF 转码缓存 |
 
 > 18080 只用于设备回拉节目包。SDK 的 HTTP 服务本身没有“关闭上传”开关，程序启动后会删除其独立的
-> `.sdk-http-incoming` 目录，使 POST/PUT 返回 400；同时不启用 `ALLOW_ABSOLUTE_PATH`，无法通过
-> `/d:/...` 读取下载根目录之外的文件。不要手工重建该目录，也不要把 `ExportRoot`/`UploadRoot` 配成同一目录。
+> `.sdk-http-incoming` 目录，使 POST/PUT 返回 400。SDK 的 `ledsdk_send_program` 强制要求
+> `ALLOW_ABSOLUTE_PATH`，所以 18080 会允许 `/d:/...` 形式的绝对路径读取；必须用防火墙把 TCP 18080
+> 入站来源限制为 LED 设备网段，不要暴露到不受信任网络。不要手工重建上传目录，也不要把
+> `ExportRoot`/`UploadRoot` 配成同一目录。
 | `Sdk.WorkerCount` | `2` | SDK 工作线程数 |
 | `Sdk.DefaultDurationSeconds` / `DefaultRepeatTimes` | `5` / `1` | 文本与图片素材的默认播放时长/次数 |
 | `Sdk.SendRetryCount` / `SendRetryBackoffMs` | `2` / `500` | 发送重试 |
@@ -241,7 +243,8 @@ curl.exe -X POST http://127.0.0.1:5180/api/program `
 
 | 现象 | 处理 |
 | --- | --- |
-| 发送超时、设备没开始下载 | 1) 防火墙放行本程序 TCP 18080 入站；2) 下载地址必须是设备同网段的本机 IPv4；3) HTTP 根目录与导出目录一致 |
+| 发送超时、设备没开始下载 | 1) 防火墙只放行 LED 设备网段访问本程序 TCP 18080 入站；2) 下载地址必须是设备同网段的本机 IPv4；3) HTTP 根目录与导出目录一致 |
+| `HTTP service must enable absolute path downloads` | SDK 发送必须启用绝对路径下载；当前版本已开启。若仍出现，确认运行的是 1.0.2+ 安装包 |
 | `设备 '…' 不在当前搜索快照中` | 设备离线/不在同网段；确认上电后等一轮搜索（2 秒）再重试 |
 | `本机有 N 个候选网卡` | 多网卡无法确定设备可达地址：给该屏幕配 `LocalAddress`，或让设备与某一网段同网段 |
 | 设备拒收节目（`file_state=3`） | 屏幕 `Width`/`Height` 与面板实际分辨率不符（搜索不提供分辨率，需人工补录） |
@@ -275,11 +278,11 @@ curl.exe -X POST http://127.0.0.1:5180/api/program `
 
 ```powershell
 .\build-installer.ps1                          # 单独生成安装包
-.\dist\LedSdk-Setup-1.0.1.exe                  # 图形安装（可改安装路径、勾选桌面/开始菜单图标）
-.\dist\LedSdk-Setup-1.0.1.exe /silent          # 静默安装（默认创建两个图标）
-.\dist\LedSdk-Setup-1.0.1.exe /silent /nodesktop /nostartmenu
-.\dist\LedSdk-Setup-1.0.1.exe /silent /dir D:\Apps\LedSdk
-.\dist\LedSdk-Setup-1.0.1.exe /verify <目录>   # 只校验内嵌负载，不安装
+.\dist\LedSdk-Setup-1.0.2.exe                  # 图形安装（可改安装路径、勾选桌面/开始菜单图标）
+.\dist\LedSdk-Setup-1.0.2.exe /silent          # 静默安装（默认创建两个图标）
+.\dist\LedSdk-Setup-1.0.2.exe /silent /nodesktop /nostartmenu
+.\dist\LedSdk-Setup-1.0.2.exe /silent /dir D:\Apps\LedSdk
+.\dist\LedSdk-Setup-1.0.2.exe /verify <目录>   # 只校验内嵌负载，不安装
 ```
 
 图形安装可在「安装位置」中直接输入或点击「浏览…」选择目录；升级时会优先填入注册表中记录的现有安装位置。默认安装目标为 `%LOCALAPPDATA%\Programs\LedSdk`，静默安装可用 `/dir <绝对路径>` 指定目录。安装器会拒绝磁盘根目录、Windows 系统目录、被文件占用的路径和不可写目录。安装后会写入 HKCU「应用和功能」卸载项，卸载时只删除指向本安装目录的快捷方式与自启项。托盘模式下关闭窗口或点「退出」都会先询问是否退出到托盘模式；选「是」隐藏到托盘，选「否」关闭软件。再次启动会自动唤起已有窗口，不会重复占用 SDK 端口。
@@ -307,7 +310,7 @@ curl.exe -X POST http://127.0.0.1:5180/api/program `
 | 项 | 结果 |
 | --- | --- |
 | `cargo build` / `cargo build --release` | 0 警告 0 错误 |
-| `--selfcheck` | 14/14 结构体尺寸、`LedSDK 1.0.0 (ABI 2)`、清单编辑/坏配置恢复、节目包校验、异常日志、保留清理、SDK HTTP 隔离、生命周期通过 |
+| `--selfcheck` | 14/14 结构体尺寸、`LedSDK 1.0.0 (ABI 2)`、清单编辑/坏配置恢复、节目包校验、异常日志、保留清理、SDK HTTP 绝对路径下载与上传隔离、生命周期通过 |
 | `--simulate` | 85 项断言通过（3 屏 × 文字/单行文字/图片/视频/GIF + 4.1 MB 大文件上传 + 无 token/错 token 401 + 作业中关闭） |
 | 上传上限 | 3 MB / 4.1 MB 上传均正常（旧实现被 axum 默认 2 MB 挡掉） |
 | 接口鉴权 | `UploadApi.Token` 非空时缺 `Authorization` 返回 401 |
@@ -316,6 +319,6 @@ curl.exe -X POST http://127.0.0.1:5180/api/program `
 | 退出按钮/右上角关闭 | 均弹出「是否退出到托盘模式」；是→隐藏，否→退出并释放端口 |
 | 单实例 | 关闭到托盘后再次启动，新进程约 0.2 秒退出并唤起已有窗口 |
 | 启动失败 / CLI 早退 | 干净返回退出码（不再出现 0xC0000409 外来异常中止） |
-| 单文件安装包 | `dist\LedSdk-Setup-1.0.1.exe` 图形/静默安装、卸载、内嵌负载校验通过 |
+| 单文件安装包 | `dist\LedSdk-Setup-1.0.2.exe` 图形/静默安装、卸载、内嵌负载校验通过 |
 | 卸载程序 | 运行检测/强制停止、快捷方式/自启/用户数据勾选、卸载项清理通过 |
 | 真机投屏 | 未在本次环境验证（需设备同网段） |

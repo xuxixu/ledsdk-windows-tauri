@@ -574,8 +574,9 @@ fn check_http_hardening(runtime: &crate::runtime::Runtime) -> i32 {
     );
     let absolute_path = format!("/{}", outside.to_string_lossy().replace('\\', "/"));
     failures += expect_bool(
-        "绝对路径读取被拒绝",
-        http_request(port, "GET", &absolute_path, &[]).is_some_and(|(status, _)| status != 200),
+        "绝对路径下载可用（SDK 发送所需）",
+        http_request(port, "GET", &absolute_path, &[])
+            .is_some_and(|(status, body)| status == 200 && body.contains("outside-root")),
         true,
     );
     let put_status = http_request(port, "PUT", "/selfcheck-evil.txt", b"evil");

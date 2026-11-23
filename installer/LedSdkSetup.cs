@@ -17,8 +17,8 @@ using Microsoft.Win32;
 [assembly: AssemblyDescription("LedSdk 屏幕节目上传服务安装程序")]
 [assembly: AssemblyProduct("LedSdk")]
 [assembly: AssemblyCompany("LedSdk")]
-[assembly: AssemblyVersion("1.0.1.0")]
-[assembly: AssemblyFileVersion("1.0.1.0")]
+[assembly: AssemblyVersion("1.0.2.0")]
+[assembly: AssemblyFileVersion("1.0.2.0")]
 
 namespace LedSdkSetup
 {
@@ -32,7 +32,7 @@ namespace LedSdkSetup
 
     internal static class Program
     {
-        internal const string Version = "1.0.1";
+        internal const string Version = "1.0.2";
         internal const string PayloadResource = "LedSdkPayload.zip";
         private const string WebView2DownloadUrl = "https://go.microsoft.com/fwlink/p/?LinkId=2124703";
 
