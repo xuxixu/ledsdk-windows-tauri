@@ -43,7 +43,7 @@ pub fn clean(
     }
 
     // 上传暂存：作业正常结束会自己删，但强杀/断电会留下孤儿文件。
-    match clean_plain_directory(upload_root, cutoff) {
+    match clean_upload_directory(upload_root, cutoff) {
         Ok((files, size)) => {
             deleted += files;
             bytes += size;
@@ -100,6 +100,27 @@ fn is_empty_directory(directory: &Path) -> bool {
     std::fs::read_dir(directory)
         .map(|mut entries| entries.next().is_none())
         .unwrap_or(false)
+}
+
+/// 上传暂存的归属标记：只有程序自己建的目录才有，用来防 UploadRoot 配错删掉别人的文件。
+const UPLOAD_MARKER: &str = ".ledsdk-upload";
+
+/// 上传暂存目录清理：与日志目录规则相同，但要求目录「空」或「带标记」才算我们的。
+fn clean_upload_directory(directory: &Path, cutoff: SystemTime) -> std::io::Result<(usize, u64)> {
+    if !is_safe_directory(directory) {
+        return Ok((0, 0));
+    }
+    let marker = directory.join(UPLOAD_MARKER);
+    if !marker.is_file() && !is_empty_directory(directory) {
+        warn!(
+            "跳过上传目录清理：{} 非空且没有 {UPLOAD_MARKER} 标记，可能不是上传暂存目录。",
+            directory.display()
+        );
+        return Ok((0, 0));
+    }
+    // 刷新标记的 mtime，否则它自己会在若干天后被当成过期文件删掉，下次就认不出目录了。
+    let _ = std::fs::write(&marker, b"");
+    clean_plain_directory(directory, cutoff)
 }
 
 fn clean_export_directory(directory: &Path, cutoff: SystemTime) -> std::io::Result<(usize, u64)> {

@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 
 use log::{error, info, warn};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, ERROR_SUCCESS,
+    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS,
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
@@ -14,8 +14,8 @@ use windows_sys::Win32::System::JobObjects::{
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows_sys::Win32::System::Registry::{
-    RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegQueryValueExW, RegSetValueExW, HKEY,
-    HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ,
+    RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
+    HKEY, HKEY_CURRENT_USER, KEY_READ, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ,
 };
 use windows_sys::Win32::System::Threading::{CreateMutexW, GetCurrentProcess, Sleep};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -156,14 +156,58 @@ pub fn assign_current_process() -> bool {
 
 /// 同步开机自启项：与配置一致就不动，不一致才写 / 删。
 pub fn sync_autostart(enabled: bool) {
-    let exe = match std::env::current_exe() {
-        Ok(path) => path,
-        Err(err) => {
-            warn!("读取当前可执行文件路径失败，跳过开机自启：{err}");
-            return;
+    let desired = if enabled {
+        match std::env::current_exe() {
+            Ok(path) => format!("\"{}\"", path.display()),
+            Err(err) => {
+                warn!("读取当前可执行文件路径失败，跳过开机自启：{err}");
+                return;
+            }
         }
+    } else {
+        String::new()
     };
 
+    let current = autostart_value();
+    if enabled {
+        if current.as_deref() == Some(desired.as_str()) {
+            info!("开机自启动项已是最新：{VALUE_NAME} = {desired}");
+        } else if set_autostart(Some(&desired)) {
+            info!("已登记开机自启动：{VALUE_NAME} = {desired}");
+        }
+    } else if current.is_some() {
+        if set_autostart(None) {
+            info!("已按配置关闭开机自启动（删除 HKCU Run 的 {VALUE_NAME}）。");
+        }
+    } else {
+        info!("开机自启动未启用（配置 AutoStart=false，HKCU Run 无 {VALUE_NAME}），无需处理。");
+    }
+}
+
+/// 读 HKCU Run 里本程序的自启值；没有时返回 None。
+pub fn autostart_value() -> Option<String> {
+    let mut key: HKEY = std::ptr::null_mut();
+    let sub_key = wide(RUN_KEY);
+    // 读只用 RegOpenKeyExW：键不存在就当作「未登记」，不去创建它。
+    let rc = unsafe {
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            sub_key.as_ptr(),
+            0,
+            KEY_READ,
+            &mut key,
+        )
+    };
+    if rc != ERROR_SUCCESS {
+        return None;
+    }
+    let value = read_value(key, &wide(VALUE_NAME));
+    unsafe { RegCloseKey(key) };
+    value
+}
+
+/// 写 / 删 HKCU Run 自启值；`None` 表示删除。返回是否成功。
+pub fn set_autostart(value: Option<&str>) -> bool {
     let mut key: HKEY = std::ptr::null_mut();
     let sub_key = wide(RUN_KEY);
     let rc = unsafe {
@@ -173,7 +217,7 @@ pub fn sync_autostart(enabled: bool) {
             0,
             std::ptr::null(),
             REG_OPTION_NON_VOLATILE,
-            KEY_READ | KEY_SET_VALUE,
+            KEY_SET_VALUE,
             std::ptr::null(),
             &mut key,
             std::ptr::null_mut(),
@@ -181,17 +225,14 @@ pub fn sync_autostart(enabled: bool) {
     };
     if rc != ERROR_SUCCESS {
         error!("打开开机自启注册表项失败：错误码 {rc}");
-        return;
+        return false;
     }
 
     let name = wide(VALUE_NAME);
-    let desired = format!("\"{}\"", exe.display());
-
-    if enabled {
-        let current = read_value(key, &name);
-        if current.as_deref() != Some(desired.as_str()) {
-            let data = wide(&desired);
-            let rc = unsafe {
+    let rc = match value {
+        Some(text) => {
+            let data = wide(text);
+            unsafe {
                 RegSetValueExW(
                     key,
                     name.as_ptr(),
@@ -200,27 +241,18 @@ pub fn sync_autostart(enabled: bool) {
                     data.as_ptr() as *const u8,
                     (data.len() * 2) as u32,
                 )
-            };
-            if rc == ERROR_SUCCESS {
-                info!("已登记开机自启动：{VALUE_NAME} = {desired}");
-            } else {
-                error!("写入开机自启失败：错误码 {rc}");
             }
-        } else {
-            info!("开机自启动项已是最新：{VALUE_NAME} = {desired}");
         }
-    } else if read_value(key, &name).is_some() {
-        let rc = unsafe { RegDeleteValueW(key, name.as_ptr()) };
-        if rc == ERROR_SUCCESS {
-            info!("已按配置关闭开机自启动（删除 HKCU Run 的 {VALUE_NAME}）。");
-        } else {
-            error!("删除开机自启项失败：错误码 {rc}");
-        }
-    } else {
-        info!("开机自启动未启用（配置 AutoStart=false，HKCU Run 无 {VALUE_NAME}），无需处理。");
-    }
-
+        None => unsafe { RegDeleteValueW(key, name.as_ptr()) },
+    };
     unsafe { RegCloseKey(key) };
+
+    if rc == ERROR_SUCCESS || (value.is_none() && rc == ERROR_FILE_NOT_FOUND) {
+        true
+    } else {
+        error!("写入/删除开机自启失败：错误码 {rc}");
+        false
+    }
 }
 
 fn read_value(key: HKEY, name: &[u16]) -> Option<String> {

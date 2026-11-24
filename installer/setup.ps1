@@ -40,6 +40,10 @@ if ($target.Equals($windowsDir, [System.StringComparison]::OrdinalIgnoreCase) -o
 }
 $exe = Join-Path $target 'ledsdk-tauri.exe'
 $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+# 节目包由设备从本机 18080 拉取；规则只放开本机所在网段，避免同网段以外读取绝对路径。
+# 规则名不带端口：端口改了也能先删旧规则再加新的。
+$firewallRule = 'LedSdk 节目包下载'
+$firewallPort = 18080
 
 function Show-Usage {
     Write-Host @"
@@ -108,6 +112,54 @@ function Test-VCRuntime {
     return (Test-Path (Join-Path $env:WINDIR 'System32\msvcp120.dll')) -and (Test-Path (Join-Path $env:WINDIR 'System32\msvcr120.dll'))
 }
 
+function Test-Elevated {
+    $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Test-FirewallRule {
+    & netsh advfirewall firewall show rule name="$firewallRule" *> $null
+    return $LASTEXITCODE -eq 0
+}
+
+# netsh 改防火墙必须提权；非管理员时用一个隐藏的提权 PowerShell 只跑这一串 netsh。
+function Invoke-FirewallNetsh([string]$Command) {
+    if (Test-Elevated) {
+        Invoke-Expression $Command | Out-Null
+        return $LASTEXITCODE -eq 0
+    }
+    try {
+        $proc = Start-Process -FilePath 'powershell.exe' -Verb RunAs -Wait -PassThru -WindowStyle Hidden -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $Command
+        return $proc.ExitCode -eq 0
+    } catch {
+        return $false
+    }
+}
+
+function Set-FirewallRule([bool]$Enabled) {
+    if ($Enabled) {
+        # 先删同名旧规则再添加：netsh add 不会覆盖，重复安装会堆出多条。
+        $add = "netsh advfirewall firewall delete rule name='$firewallRule' | Out-Null; " +
+               "netsh advfirewall firewall add rule name='$firewallRule' dir=in action=allow protocol=TCP " +
+               "localport=$firewallPort remoteip=localsubnet profile=any enable=yes"
+        Invoke-FirewallNetsh $add | Out-Null
+        if (Test-FirewallRule) {
+            Write-Host "已添加防火墙规则：TCP $firewallPort 仅允许本机所在网段。"
+        } else {
+            Write-Warning "未能添加防火墙规则（需要管理员权限）。请以管理员身份重新运行安装，或手动执行："
+            Write-Warning "  netsh advfirewall firewall add rule name=`"$firewallRule`" dir=in action=allow protocol=TCP localport=$firewallPort remoteip=localsubnet profile=any"
+        }
+    } else {
+        if (-not (Test-FirewallRule)) { return }
+        Invoke-FirewallNetsh "netsh advfirewall firewall delete rule name='$firewallRule'" | Out-Null
+        if (Test-FirewallRule) {
+            Write-Warning "未能删除防火墙规则 `"$firewallRule`"（需要管理员权限）。"
+        } else {
+            Write-Host "已删除防火墙规则：$firewallRule"
+        }
+    }
+}
+
 if ($Uninstall) {
     if (-not $Quiet) {
         $answer = Read-Host "确认卸载 $target 并删除快捷方式？[y/N]"
@@ -130,6 +182,7 @@ if ($Uninstall) {
         Remove-ItemProperty -Path $runKey -Name 'LedSdkTauri' -ErrorAction SilentlyContinue
     }
     Remove-Item -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\LedSdk' -Recurse -Force -ErrorAction SilentlyContinue
+    Set-FirewallRule $false
     $keep = @('config', 'export', 'logs', 'cache', 'upload')
     if (Test-Path $target) {
         if ($PurgeData) {
@@ -210,6 +263,18 @@ $configJson = $config | ConvertTo-Json -Depth 10
 # 显式写 UTF-8 无 BOM：Rust 端 serde_json 不接受 BOM。
 [System.IO.File]::WriteAllText($configPath, $configJson, (New-Object System.Text.UTF8Encoding($false)))
 
+# 防火墙规则按实际下载端口开放；配置里没有或非法时用默认 18080。
+$port = 0
+if ($config.Sdk -and [int]::TryParse([string]$config.Sdk.DownloadPort, [ref]$port) -and $port -gt 0 -and $port -le 65535) {
+    $firewallPort = $port
+}
+if ($config.Sdk -and $config.Sdk.BindAddress) {
+    $bind = [string]$config.Sdk.BindAddress
+    if ($bind -and $bind -notin @('0.0.0.0', '::', '[::]', '*')) {
+        Write-Warning "Sdk.BindAddress=$bind：设备将无法从网段访问 18080，防火墙规则不会放行。"
+    }
+}
+
 function New-Shortcut([string]$Path) {
     $shell = New-Object -ComObject WScript.Shell
     $shortcut = $shell.CreateShortcut($Path)
@@ -235,6 +300,9 @@ if ($config.App.AutoStart) {
 } else {
     Remove-ItemProperty -Path $runKey -Name 'LedSdkTauri' -ErrorAction SilentlyContinue
 }
+
+# 18080 带绝对路径下载能力（SDK 发送必需），只按网段放开，不能留成任意来源可读。
+Set-FirewallRule $true
 
 Write-Host "已安装到：$target"
 Write-Host "桌面图标：$(-not $NoDesktopShortcut)；开始菜单图标：$(-not $NoStartMenuShortcut)"

@@ -18,6 +18,7 @@ pub fn run() -> i32 {
         println!("SDK 版本：  [skip] 本平台没有 LedSDK（仅 Windows x64 / Linux x64）");
     }
     failures += check_registry_edits();
+    failures += check_autostart();
     failures += check_package_guard();
     failures += check_exception_log();
     failures += check_retention();
@@ -218,6 +219,56 @@ fn expect_bool(name: &str, actual: bool, wanted: bool) -> i32 {
 }
 
 /// 发送前的包内地址校验与失败提示（对应 C# 版 PackageGuardCheck 的 5 条断言）。
+/// 开机自启：写 → 读 → 删 三步都要真的落到 HKCU Run，结束时恢复自检前的状态。
+/// 诊断程序不该改用户机器，但这里是程序自己的值，且会被恢复。
+#[cfg(windows)]
+fn check_autostart() -> i32 {
+    println!("开机自启（HKCU Run）：");
+    let original = crate::winos::autostart_value();
+    let expected = match std::env::current_exe() {
+        Ok(path) => format!("\"{}\"", path.display()),
+        Err(err) => {
+            println!("  [FAIL] 读取当前 exe 失败：{err}");
+            return 1;
+        }
+    };
+
+    let mut failures = 0;
+    crate::winos::sync_autostart(true);
+    let written = crate::winos::autostart_value();
+    failures += expect_bool(
+        "启用后写入带引号的 exe 路径",
+        written.as_deref() == Some(expected.as_str()),
+        true,
+    );
+    // 配置没变时不应重写（这里只能验证值不变，日志里的「已是最新」分支由 sync_autostart 保证）。
+    crate::winos::sync_autostart(true);
+    failures += expect_bool(
+        "重复启用后值不变",
+        crate::winos::autostart_value() == written,
+        true,
+    );
+    crate::winos::sync_autostart(false);
+    failures += expect_bool(
+        "关闭后删除自启值",
+        crate::winos::autostart_value().is_none(),
+        true,
+    );
+
+    // 恢复原值：原先是登记状态就按原值写回，否则保持删除。
+    if !crate::winos::set_autostart(original.as_deref()) {
+        println!("  [FAIL] 恢复自检前的自启值失败");
+        failures += 1;
+    }
+    failures
+}
+
+#[cfg(not(windows))]
+fn check_autostart() -> i32 {
+    println!("开机自启：  [skip] 仅 Windows 使用 HKCU Run。");
+    0
+}
+
 fn check_package_guard() -> i32 {
     use crate::pipeline::{send_failure_hint, verify_package};
     println!("节目包校验：");
@@ -448,6 +499,22 @@ fn check_retention() -> i32 {
         skipped == 0 && other.join("stray.zhd").exists(),
         true,
     );
+    // 上传暂存：第一次清理要落下归属标记；有内容却没标记的目录（UploadRoot 配错）必须跳过。
+    failures += expect_bool(
+        "上传目录写入归属标记",
+        upload.join(".ledsdk-upload").is_file(),
+        true,
+    );
+    let foreign = root.join("foreign-upload");
+    if std::fs::create_dir_all(&foreign).is_ok() {
+        let _ = write(&foreign.join("keep.bin"), "keep", Some(old));
+        crate::retention::clean(&other, &foreign, &logs, 30);
+        failures += expect_bool(
+            "无标记的上传目录被跳过",
+            foreign.join("keep.bin").exists(),
+            true,
+        );
+    }
     failures
 }
 

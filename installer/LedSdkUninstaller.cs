@@ -16,8 +16,8 @@ using Microsoft.Win32;
 [assembly: AssemblyDescription("LedSdk 屏幕节目上传服务卸载程序")]
 [assembly: AssemblyProduct("LedSdk")]
 [assembly: AssemblyCompany("LedSdk")]
-[assembly: AssemblyVersion("1.0.4.0")]
-[assembly: AssemblyFileVersion("1.0.4.0")]
+[assembly: AssemblyVersion("1.0.5.0")]
+[assembly: AssemblyFileVersion("1.0.5.0")]
 
 namespace LedSdkUninstaller
 {
@@ -31,7 +31,7 @@ namespace LedSdkUninstaller
 
     internal static class Program
     {
-        internal const string Version = "1.0.4";
+        internal const string Version = "1.0.5";
         private const int MoveFileDelayUntilReboot = 0x4;
 
         [DllImport("user32.dll")]
@@ -221,6 +221,9 @@ namespace LedSdkUninstaller
                 DeleteOwnedAutoStart(target, errors);
             }
 
+            if (progress != null) progress("正在删除防火墙规则…");
+            DeleteFirewallRule(errors);
+
             if (progress != null) progress("正在删除卸载信息…");
             DeleteUninstallRegistry(errors);
 
@@ -309,6 +312,65 @@ namespace LedSdkUninstaller
             catch (Exception ex)
             {
                 errors.Add("删除开机自启动失败：" + ex.Message);
+            }
+        }
+
+        private static void DeleteFirewallRule(List<string> errors)
+        {
+            // 与 setup.ps1 的规则名一致；规则存在才处理，避免无谓的提权提示。
+            const string rule = "LedSdk 节目包下载";
+            if (!FirewallRuleExists(rule)) return;
+            if (RunNetsh("advfirewall firewall delete rule name=\"" + rule + "\"", false) != 0)
+            {
+                RunNetsh("advfirewall firewall delete rule name=\"" + rule + "\"", true);
+            }
+            if (FirewallRuleExists(rule))
+            {
+                errors.Add("删除防火墙规则失败（需要管理员权限）：" + rule);
+            }
+        }
+
+        private static bool FirewallRuleExists(string rule)
+        {
+            return RunNetsh("advfirewall firewall show rule name=\"" + rule + "\"", false) == 0;
+        }
+
+        /// <summary>跑 netsh；elevated 时走 UAC（只用于需要管理员权限的删除）。</summary>
+        private static int RunNetsh(string arguments, bool elevated)
+        {
+            try
+            {
+                ProcessStartInfo start = new ProcessStartInfo("netsh.exe", arguments);
+                start.CreateNoWindow = true;
+                if (elevated)
+                {
+                    start.UseShellExecute = true;
+                    start.Verb = "runas";
+                }
+                else
+                {
+                    start.UseShellExecute = false;
+                    start.RedirectStandardOutput = true;
+                    start.RedirectStandardError = true;
+                }
+                using (Process process = Process.Start(start))
+                {
+                    if (!elevated)
+                    {
+                        process.StandardOutput.ReadToEnd();
+                        process.StandardError.ReadToEnd();
+                    }
+                    if (!process.WaitForExit(15000))
+                    {
+                        return -1;
+                    }
+                    return process.ExitCode;
+                }
+            }
+            catch
+            {
+                // 用户拒绝了 UAC 或 netsh 不可用；由调用方复查规则是否还在。
+                return -1;
             }
         }
 

@@ -1,7 +1,7 @@
 ﻿# 构建单文件安装包：把 dist\ 的运行文件压成 payload，再编译进 LedSdk-Setup-<version>.exe。
 # 依赖 Windows 自带的 .NET Framework 4.8（csc.exe），不引入第三方安装器工具。
 param(
-    [string]$Version = '1.0.4'
+    [string]$Version = '1.0.5'
 )
 
 $ErrorActionPreference = 'Stop'
